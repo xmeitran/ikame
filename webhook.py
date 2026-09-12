@@ -28,6 +28,7 @@ PROJECTS_TABLE_ID = os.getenv("PROJECTS_TABLE_ID")
 TASKS_TABLE_ID = os.getenv("TASKS_TABLE_ID")
 MILESTONES_TABLE_ID = os.getenv("MILESTONES_TABLE_ID")
 WORKFLOW_TABLE_ID = os.getenv("WORKFLOW_TABLE_ID")
+DELIVERY_TABLE_ID = os.getenv("DELIVERY_TABLE_ID")
 CODEX_BIN = os.getenv("CODEX_BIN", "/Applications/ChatGPT.app/Contents/Resources/codex")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
@@ -125,9 +126,53 @@ def field_text(value):
 
 def clone_workflow_template(project_id, project_name, owner=""):
     """Instantiate the 21-day template for a newly created project."""
-    if not WORKFLOW_TABLE_ID or not MILESTONES_TABLE_ID or not project_id:
+    if not WORKFLOW_TABLE_ID or not project_id:
         return
     rows = bitable_list(WORKFLOW_TABLE_ID)
+    # New CRM design: one operational table, linked to the project, with a
+    # self-referencing Parent Item hierarchy.  This keeps every milestone and
+    # task visible in one grouped view while retaining the old tables as a
+    # compatibility fallback during migration.
+    if DELIVERY_TABLE_ID:
+        created = {}
+        for row in rows:
+            f = row.get("fields") or {}
+            milestone = field_text(f.get("Milestone")) or field_text(f.get("Phase"))
+            task_title = field_text(f.get("Task Template"))
+            if not milestone and not task_title:
+                continue
+            milestone_id = created.get(milestone)
+            if milestone and not milestone_id:
+                mf = {
+                    "Item Name": milestone,
+                    "Item Type": "Milestone",
+                    "Project": project_name,
+                    "Status": "Upcoming",
+                    "PIC": owner,
+                    "Sequence": f.get("Sequence") or 0,
+                }
+                milestone_id = bitable_create(DELIVERY_TABLE_ID, mf)
+                created[milestone] = milestone_id
+            if task_title:
+                tf = {
+                    "Item Name": task_title,
+                    "Item Type": "Task",
+                    "Project": project_name,
+                    "Status": "Upcoming",
+                    "PIC": owner,
+                    "Sequence": f.get("Sequence") or 0,
+                }
+                if milestone_id:
+                    tf["Parent Item"] = milestone
+                try:
+                    bitable_create(DELIVERY_TABLE_ID, tf)
+                except Exception as exc:
+                    log.warning("Delivery task parent link failed, retrying without Parent Item: %s", exc)
+                    tf.pop("Parent Item", None); bitable_create(DELIVERY_TABLE_ID, tf)
+        log.info("Cloned %d workflow row(s) into Delivery Plan for %s", len(rows), project_name)
+        return
+    if not MILESTONES_TABLE_ID or not project_id:
+        return
     for row in rows:
         f = row.get("fields") or {}
         milestone = field_text(f.get("Milestone")) or field_text(f.get("Phase"))
@@ -335,7 +380,7 @@ def create_project_and_tasks(event, title, transcript):
     used only when they are already Lark open_ids; otherwise we fall back to
     the meeting owner/participant so a task is never silently dropped.
     """
-    if not PROJECTS_TABLE_ID or not TASKS_TABLE_ID:
+    if not PROJECTS_TABLE_ID or (not TASKS_TABLE_ID and not DELIVERY_TABLE_ID):
         log.warning("Project/task table IDs are not configured; skipping task creation")
         return {"project": title, "tasks": []}
     plan = openai_plan(transcript) or codex_plan(transcript)
@@ -367,17 +412,31 @@ def create_project_and_tasks(event, title, transcript):
                 continue
             ai_owner = str(task.get("owner") or "").strip()
             owner = ai_owner if ai_owner.startswith("ou_") else fallback_owner
-            task_fields = {"Task name": task_title, "Owner": ([{"id": owner}] if owner else []), "Description": task.get("description") or plan.get("summary_vi") or plan.get("meeting_summary_vi") or transcript or ""}
+            if DELIVERY_TABLE_ID:
+                milestone_name = str(task.get("milestone") or project.get("milestone") or "").strip()
+                parent_id = ""
+                if milestone_name:
+                    for r in bitable_list(DELIVERY_TABLE_ID):
+                        rf = r.get("fields") or {}
+                        if field_text(rf.get("Item Name")).casefold() == milestone_name.casefold() and field_text(rf.get("Project")).casefold() == project_name.casefold():
+                            parent_id = r.get("record_id", ""); break
+                task_fields = {"Item Name": task_title, "Item Type": "Task", "Status": "Open", "PIC": owner, "Project": project_name}
+                if milestone_name: task_fields["Parent Item"] = milestone_name
+                target_table = DELIVERY_TABLE_ID
+            else:
+                task_fields = {"Task name": task_title, "Owner": ([{"id": owner}] if owner else []), "Description": task.get("description") or plan.get("summary_vi") or plan.get("meeting_summary_vi") or transcript or ""}
+                target_table = TASKS_TABLE_ID
             deadline = task.get("deadline") or ""
             if re.fullmatch(r"\d{4}-\d{2}-\d{2}", deadline):
                 task_fields["Deadline"] = int(datetime.datetime.strptime(deadline, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
             if project_id:
-                task_fields["Project"] = [{"record_id": project_id}]
+                task_fields.setdefault("Project", project_name)
             try:
-                bitable_create(TASKS_TABLE_ID, task_fields)
+                bitable_create(target_table, task_fields)
             except Exception as exc:
                 log.warning("Task link failed, retrying without Project: %s", exc)
-                task_fields.pop("Project", None); bitable_create(TASKS_TABLE_ID, task_fields)
+                task_fields.pop("Project", None)
+                bitable_create(target_table, task_fields)
             total_tasks += 1
     log.info("Created %d project(s) and %d extracted task(s)", len(projects), total_tasks)
     return plan
