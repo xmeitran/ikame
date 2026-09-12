@@ -183,6 +183,10 @@ def find_project_id(project_name):
             return row.get("record_id", "")
     return ""
 
+def latest_project_record():
+    rows = bitable_list(PROJECTS_TABLE_ID)
+    return max(rows, key=lambda row: row.get("created_time", 0) or 0) if rows else {}
+
 def handle_project_created(event):
     """Clone the standard workflow after a Base Project record is created."""
     fields = event.get("fields") or event.get("record") or event.get("data") or event
@@ -195,7 +199,12 @@ def handle_project_created(event):
         if isinstance(record, dict):
             record_id = record_id or str(record.get("record_id") or record.get("recordId") or "")
     record_id = record_id or find_value(event, {"project_record_id", "record_id"})
-    record_id = record_id or find_project_id(project_name)
+    if not record_id and project_name:
+        record_id = find_project_id(project_name)
+    if not record_id and not project_name:
+        latest = latest_project_record()
+        record_id = latest.get("record_id", "")
+        project_name = field_text((latest.get("fields") or {}).get("Project Name"))
     owner = find_value(event, {"owner_open_id", "open_id"})
     if not project_name or not record_id:
         raise RuntimeError("Project-created event must include Project Name and record_id")
