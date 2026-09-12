@@ -317,7 +317,11 @@ def update_delivery_progress(plan, meeting_title=""):
             try:
                 bitable_update(DELIVERY_TABLE_ID, existing.get("record_id", ""), fields)
             except Exception as exc:
-                log.warning("Delivery milestone update failed: %s", exc)
+                log.warning("Delivery milestone update failed; applying core fields: %s", exc)
+                core = {k: fields[k] for k in ("Status", "Progress %") if k in fields}
+                if core:
+                    try: bitable_update(DELIVERY_TABLE_ID, existing.get("record_id", ""), core)
+                    except Exception as inner: log.warning("Delivery core update failed: %s", inner)
             for task in milestone.get("tasks") or []:
                 title = str(task.get("title") or "").strip()
                 if not title:
@@ -339,7 +343,12 @@ def update_delivery_progress(plan, meeting_title=""):
                     fields["Risk / Blocker"] = task.get("risk")
                 if task_row:
                     try: bitable_update(DELIVERY_TABLE_ID, task_row.get("record_id", ""), fields)
-                    except Exception as exc: log.warning("Delivery task update failed: %s", exc)
+                    except Exception as exc:
+                        log.warning("Delivery task update failed; applying core fields: %s", exc)
+                        core = {k: fields[k] for k in ("Status", "PIC", "Priority", "Progress %") if k in fields}
+                        if core:
+                            try: bitable_update(DELIVERY_TABLE_ID, task_row.get("record_id", ""), core)
+                            except Exception as inner: log.warning("Delivery task core update failed: %s", inner)
 
 def flatten_plan_tasks(plan):
     """Flatten portfolio-style AI output while keeping legacy output compatible."""
