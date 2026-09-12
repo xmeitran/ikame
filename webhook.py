@@ -154,6 +154,16 @@ def clone_workflow_template(project_id, project_name, owner=""):
                     "Template Source": "21-day master",
                     "Progress %": 0,
                 }
+                offset = f.get("Offset Day")
+                duration = f.get("Duration Days")
+                try:
+                    if offset is not None:
+                        start_ms = int((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=float(offset))).timestamp() * 1000)
+                        mf["Start Date"] = start_ms
+                        if duration is not None:
+                            mf["Due Date"] = int((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=float(offset) + float(duration))).timestamp() * 1000)
+                except (TypeError, ValueError):
+                    log.warning("Ignoring invalid template dates for milestone %s", milestone)
                 milestone_id = bitable_create(DELIVERY_TABLE_ID, mf)
                 created[milestone] = milestone_id
             if task_title:
@@ -169,6 +179,16 @@ def clone_workflow_template(project_id, project_name, owner=""):
                     "Template Source": "21-day master",
                     "Progress %": 0,
                 }
+                offset = f.get("Offset Day")
+                duration = f.get("Duration Days")
+                try:
+                    if offset is not None:
+                        start_ms = int((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=float(offset))).timestamp() * 1000)
+                        tf["Start Date"] = start_ms
+                        if duration is not None:
+                            tf["Due Date"] = int((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=float(offset) + float(duration))).timestamp() * 1000)
+                except (TypeError, ValueError):
+                    log.warning("Ignoring invalid template dates for task %s", task_title)
                 if milestone_id:
                     tf["Parent Item"] = milestone
                 try:
