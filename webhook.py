@@ -618,6 +618,17 @@ def extract_minutes_url(value):
     match = re.search(r"https?://[^\"\s<>]+(?:minutes|minute)[^\"\s<>]*", text, re.I)
     return match.group(0).rstrip(".,)") if match else ""
 
+def fetch_message_payload(message_id):
+    """Fetch the parent/root message for reply events (e.g. forwarded cards)."""
+    if not message_id:
+        return {}
+    url = f"{DOMAIN}/open-apis/im/v1/messages/{urllib.parse.quote(str(message_id), safe='')}"
+    r = requests.get(url, headers={"Authorization": f"Bearer {tenant_token()}"}, timeout=20)
+    if r.status_code >= 300:
+        log.warning("Unable to fetch parent message %s: %s", message_id, r.status_code)
+        return {}
+    return r.json().get("data", {}).get("items", [{}])[0] if isinstance(r.json().get("data", {}).get("items"), list) else r.json().get("data", {})
+
 def create_forwarded_minutes_record(event, minute_url):
     """Create a Base row when a user forwards the Minutes card/link to this bot."""
     event_id = event.get("_event_id", "unknown")
@@ -705,6 +716,14 @@ class Handler(BaseHTTPRequestHandler):
             # for the bot unless the user forwards a Lark Minutes link.
             if event_type == "im.message.receive_v1":
                 minute_url = extract_minutes_url(event)
+                if not minute_url:
+                    message = event.get("message") or {}
+                    for parent_id in (message.get("parent_id"), message.get("root_id")):
+                        parent = fetch_message_payload(parent_id)
+                        minute_url = extract_minutes_url(parent)
+                        if minute_url:
+                            log.info("Found Minutes link in parent message %s", parent_id)
+                            break
                 if minute_url:
                     create_forwarded_minutes_record(event, minute_url)
                 else:
