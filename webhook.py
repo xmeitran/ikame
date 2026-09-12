@@ -636,7 +636,12 @@ def create_forwarded_minutes_record(event, minute_url):
     # path component is the minute token used by the transcript API.
     parsed = urllib.parse.urlparse(minute_url)
     path_parts = [p for p in parsed.path.split("/") if p]
-    minute_token = path_parts[-1] if path_parts else ""
+    raw_token = urllib.parse.unquote(path_parts[-1]) if path_parts else ""
+    # Rich-message forwarding can append the bot mention (e.g. @\_user\_1)
+    # or an escaped backslash to the URL.  The Minutes API accepts only the
+    # actual opaque token, which is the leading URL-safe segment.
+    token_match = re.match(r"([A-Za-z0-9_-]+)", raw_token)
+    minute_token = token_match.group(1) if token_match else ""
     transcript = ""
     if minute_token and minute_token.lower() not in {"minutes", "minute", "min"}:
         try:
