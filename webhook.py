@@ -285,6 +285,62 @@ def plan_to_meeting_fields(plan):
         "Ingestion Status": "Imported — AI processed",
     }
 
+def normalize_name(value):
+    return re.sub(r"\s+", " ", field_text(value).casefold()).strip()
+
+def update_delivery_progress(plan, meeting_title=""):
+    """Update existing Delivery Plan items from portfolio AI output."""
+    if not DELIVERY_TABLE_ID or not isinstance(plan, dict):
+        return
+    rows = bitable_list(DELIVERY_TABLE_ID)
+    index = {(normalize_name((r.get("fields") or {}).get("Project")), normalize_name((r.get("fields") or {}).get("Item Name"))): r for r in rows}
+    for project in plan.get("projects") or []:
+        project_name = project.get("project") or project.get("name") or ""
+        pkey = normalize_name(project_name)
+        for milestone in project.get("milestones") or []:
+            milestone_name = milestone.get("milestone") or milestone.get("name") or ""
+            key = (pkey, normalize_name(milestone_name))
+            existing = index.get(key)
+            if not existing:
+                continue
+            fields = {
+                "Status": milestone.get("status") or "In Progress",
+                "Next Action": milestone.get("next_step") or "",
+                "Source Meeting": meeting_title,
+                "AI Confidence": "High" if milestone_name else "Low",
+                "Needs Review": "No",
+            }
+            if milestone.get("progress_percent") is not None:
+                fields["Progress %"] = str(milestone.get("progress_percent"))
+            if milestone.get("risk"):
+                fields["Risk / Blocker"] = milestone.get("risk")
+            try:
+                bitable_update(DELIVERY_TABLE_ID, existing.get("record_id", ""), fields)
+            except Exception as exc:
+                log.warning("Delivery milestone update failed: %s", exc)
+            for task in milestone.get("tasks") or []:
+                title = str(task.get("title") or "").strip()
+                if not title:
+                    continue
+                tkey = (pkey, normalize_name(title))
+                task_row = index.get(tkey)
+                fields = {
+                    "Status": task.get("status") or "Open",
+                    "PIC": task.get("owner") or "",
+                    "Priority": task.get("priority") or "Medium",
+                    "Next Action": task.get("next_step") or "",
+                    "Source Meeting": meeting_title,
+                    "AI Confidence": "High",
+                    "Needs Review": "No",
+                }
+                if task.get("progress_percent") is not None:
+                    fields["Progress %"] = str(task.get("progress_percent"))
+                if task.get("risk"):
+                    fields["Risk / Blocker"] = task.get("risk")
+                if task_row:
+                    try: bitable_update(DELIVERY_TABLE_ID, task_row.get("record_id", ""), fields)
+                    except Exception as exc: log.warning("Delivery task update failed: %s", exc)
+
 def flatten_plan_tasks(plan):
     """Flatten portfolio-style AI output while keeping legacy output compatible."""
     if isinstance(plan.get("projects"), list):
@@ -328,7 +384,7 @@ def participant_ids(event):
 def extraction_prompt(transcript):
     """Prompt shared by the hosted API and the optional local Codex fallback."""
     return f'''Đọc transcript cuộc họp dưới đây. Trả về DUY NHẤT JSON hợp lệ, không markdown:
-{{"meeting_summary_vi":"Tóm tắt toàn bộ cuộc họp bằng tiếng Việt chuẩn","decisions":["quyết định quan trọng"],"projects":[{{"project":"Tên project đúng như transcript","status":"Current status","health":"On track|At risk|Blocked|Unknown","summary_vi":"Tình hình project","next_step":"Bước tiếp theo của project","milestones":[{{"milestone":"Tên milestone","status":"Current milestone status","next_step":"Bước tiếp theo của milestone","tasks":[{{"title":"việc cần làm","description":"mô tả rõ","owner":"tên người nếu nói rõ, nếu không để rỗng","deadline":"YYYY-MM-DD nếu có, nếu không để rỗng","priority":"High|Medium|Low"}}]}}]}}]}}
+{{"meeting_summary_vi":"Tóm tắt toàn bộ cuộc họp bằng tiếng Việt chuẩn","decisions":["quyết định quan trọng"],"projects":[{{"project":"Tên project đúng như transcript","status":"Current status","health":"On track|At risk|Blocked|Unknown","progress_percent":0,"summary_vi":"Tình hình project","next_step":"Bước tiếp theo của project","milestones":[{{"milestone":"Tên milestone","status":"Current milestone status","progress_percent":0,"risk":"Rủi ro hoặc blocker, nếu có","next_step":"Bước tiếp theo của milestone","tasks":[{{"title":"việc cần làm","description":"mô tả rõ","owner":"tên người nếu nói rõ, nếu không để rỗng","deadline":"YYYY-MM-DD nếu có, nếu không để rỗng","status":"Open|In Progress|Done|Blocked","progress_percent":0,"next_step":"Bước tiếp theo","risk":"Rủi ro nếu có","priority":"High|Medium|Low"}}]}}]}}]}}
 Không bịa tên người hoặc deadline. Sửa lỗi chính tả và dịch sang tiếng Việt tự nhiên.
 TRANSCRIPT:
 {transcript[:50000]}'''
@@ -406,6 +462,8 @@ def create_project_and_tasks(event, title, transcript):
                 for task in milestone.get("tasks") or []:
                     item = dict(task); item.setdefault("milestone", milestone.get("milestone") or milestone.get("name") or ""); project_tasks.append(item)
             project_tasks.extend(project.get("tasks") or [])
+        # First update existing template rows; new action items are created below.
+        update_delivery_progress({"projects": [project]}, title)
         for task in project_tasks:
             task_title = str(task.get("title") or "").strip()
             if not task_title:
