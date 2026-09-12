@@ -509,7 +509,8 @@ class Handler(BaseHTTPRequestHandler):
             event["_event_type"] = event_type
             if parsed_path == "/lark/project-created" or event_type in {"bitable.record.created_v1", "project.created_v1"}:
                 handle_project_created(event)
-                self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+                body = json.dumps({"ok": True, "status": "template_cloned"}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
             meeting_id = (event.get("meeting") or {}).get("id")
             log.info("Webhook received: event=%s meeting=%s", event_type, meeting_id)
 
