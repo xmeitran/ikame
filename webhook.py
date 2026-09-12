@@ -27,6 +27,8 @@ TABLE_ID = os.getenv("MEETINGS_TABLE_ID")
 PROJECTS_TABLE_ID = os.getenv("PROJECTS_TABLE_ID")
 TASKS_TABLE_ID = os.getenv("TASKS_TABLE_ID")
 CODEX_BIN = os.getenv("CODEX_BIN", "/Applications/ChatGPT.app/Contents/Resources/codex")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 DOMAIN = os.getenv("LARK_DOMAIN", "https://open.larksuite.com")
 OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "")
 OAUTH_STATE = secrets.token_urlsafe(24)
@@ -117,15 +119,42 @@ def participant_ids(event):
     walk(event)
     return found
 
-def codex_plan(transcript):
-    """Normalize Vietnamese transcript and extract a strict project/task plan."""
-    if not transcript:
-        return {"project": "Lark meeting project", "tasks": []}
-    prompt = f'''Đọc transcript cuộc họp dưới đây. Trả về DUY NHẤT JSON hợp lệ, không markdown:
+def extraction_prompt(transcript):
+    """Prompt shared by the hosted API and the optional local Codex fallback."""
+    return f'''Đọc transcript cuộc họp dưới đây. Trả về DUY NHẤT JSON hợp lệ, không markdown:
 {{"project":"Tên dự án ngắn","milestone":"Tên milestone hoặc giai đoạn, nếu có","summary_vi":"Tóm tắt tiếng Việt chuẩn","tasks":[{{"title":"việc cần làm","description":"mô tả rõ","owner":"tên người nếu transcript nói rõ, nếu không để rỗng","deadline":"YYYY-MM-DD nếu có, nếu không để rỗng","priority":"High|Medium|Low","milestone":"milestone của task nếu có"}}]}}
 Không bịa tên người hoặc deadline. Sửa lỗi chính tả và dịch sang tiếng Việt tự nhiên.
 TRANSCRIPT:
 {transcript[:12000]}'''
+
+def openai_plan(transcript):
+    """Use OpenAI Responses API for production transcript extraction."""
+    if not OPENAI_API_KEY or not transcript:
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=extraction_prompt(transcript),
+            store=False,
+        )
+        output = (response.output_text or "").strip()
+        match = re.search(r"\{.*\}", output, re.S)
+        if match:
+            data = json.loads(match.group(0))
+            if isinstance(data.get("tasks"), list):
+                log.info("Transcript extracted with OpenAI model %s", OPENAI_MODEL)
+                return data
+    except Exception as exc:
+        log.warning("OpenAI extraction unavailable; trying Codex fallback: %s", exc)
+    return None
+
+def codex_plan(transcript):
+    """Normalize Vietnamese transcript and extract a strict project/task plan."""
+    if not transcript:
+        return {"project": "Lark meeting project", "tasks": []}
+    prompt = extraction_prompt(transcript)
     try:
         result = subprocess.run([CODEX_BIN, "exec", "--ephemeral", "--skip-git-repo-check", prompt], capture_output=True, text=True, timeout=60)
         output = (result.stdout or "").strip()
@@ -143,7 +172,7 @@ def create_project_and_tasks(event, title, transcript):
     if not PROJECTS_TABLE_ID or not TASKS_TABLE_ID:
         log.warning("Project/task table IDs are not configured; skipping task creation")
         return
-    plan = codex_plan(transcript)
+    plan = openai_plan(transcript) or codex_plan(transcript)
     project_name = plan.get("project") or title or "Lark meeting project"
     milestone = plan.get("milestone") or ""
     project_id = bitable_create(PROJECTS_TABLE_ID, {"Project Name": project_name})
