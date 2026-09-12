@@ -150,6 +150,8 @@ def clone_workflow_template(project_id, project_name, owner=""):
                     "Status": "Upcoming",
                     "PIC": owner,
                     "Sequence": f.get("Sequence") or 0,
+                    "Template Source": "21-day master",
+                    "Progress %": "0",
                 }
                 milestone_id = bitable_create(DELIVERY_TABLE_ID, mf)
                 created[milestone] = milestone_id
@@ -161,6 +163,9 @@ def clone_workflow_template(project_id, project_name, owner=""):
                     "Status": "Upcoming",
                     "PIC": owner,
                     "Sequence": f.get("Sequence") or 0,
+                    "Priority": field_text(f.get("Default Priority")) or "Medium",
+                    "Template Source": "21-day master",
+                    "Progress %": "0",
                 }
                 if milestone_id:
                     tf["Parent Item"] = milestone
@@ -487,7 +492,17 @@ def create_project_and_tasks(event, title, transcript):
                         rf = r.get("fields") or {}
                         if field_text(rf.get("Item Name")).casefold() == milestone_name.casefold() and field_text(rf.get("Project")).casefold() == project_name.casefold():
                             parent_id = r.get("record_id", ""); break
-                task_fields = {"Item Name": task_title, "Item Type": "Task", "Status": "Open", "PIC": owner, "Project": project_name}
+                task_fields = {
+                    "Item Name": task_title,
+                    "Item Type": "Task",
+                    "Status": task.get("status") or "Open",
+                    "PIC": owner,
+                    "Project": project_name,
+                    "Priority": task.get("priority") or "Medium",
+                    "Source Meeting": title,
+                    "AI Confidence": "High" if ai_owner.startswith("ou_") else "Medium",
+                    "Needs Review": "No" if task_title else "Yes",
+                }
                 if milestone_name: task_fields["Parent Item"] = milestone_name
                 target_table = DELIVERY_TABLE_ID
             else:
@@ -495,7 +510,8 @@ def create_project_and_tasks(event, title, transcript):
                 target_table = TASKS_TABLE_ID
             deadline = task.get("deadline") or ""
             if re.fullmatch(r"\d{4}-\d{2}-\d{2}", deadline):
-                task_fields["Deadline"] = int(datetime.datetime.strptime(deadline, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+                due_ms = int(datetime.datetime.strptime(deadline, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+                task_fields["Due Date" if DELIVERY_TABLE_ID else "Deadline"] = due_ms
             if project_id:
                 task_fields.setdefault("Project", project_name)
             try:
