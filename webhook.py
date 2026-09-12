@@ -183,6 +183,25 @@ def find_project_id(project_name):
             return row.get("record_id", "")
     return ""
 
+def handle_project_created(event):
+    """Clone the standard workflow after a Base Project record is created."""
+    fields = event.get("fields") or event.get("record") or event.get("data") or event
+    project_name = field_text(fields.get("Project Name")) if isinstance(fields, dict) else ""
+    project_name = project_name or find_value(event, {"project_name", "name", "Project Name"})
+    record_id = ""
+    if isinstance(event, dict):
+        record_id = str(event.get("record_id") or event.get("recordId") or "")
+        record = event.get("record")
+        if isinstance(record, dict):
+            record_id = record_id or str(record.get("record_id") or record.get("recordId") or "")
+    record_id = record_id or find_value(event, {"project_record_id", "record_id"})
+    record_id = record_id or find_project_id(project_name)
+    owner = find_value(event, {"owner_open_id", "open_id"})
+    if not project_name or not record_id:
+        raise RuntimeError("Project-created event must include Project Name and record_id")
+    clone_workflow_template(record_id, project_name, owner)
+    log.info("Project-created event processed for %s", project_name)
+
 def bitable_update(table_id, record_id, fields):
     if not table_id or not record_id or not fields:
         return
@@ -466,6 +485,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        parsed_path = urllib.parse.urlparse(self.path).path
         length = int(self.headers.get("content-length", "0"))
         raw = self.rfile.read(length)
         try:
@@ -478,6 +498,9 @@ class Handler(BaseHTTPRequestHandler):
             event["_event_id"] = header.get("event_id", "unknown")
             event_type = header.get("event_type") or header.get("event")
             event["_event_type"] = event_type
+            if parsed_path == "/lark/project-created" or event_type in {"bitable.record.created_v1", "project.created_v1"}:
+                handle_project_created(event)
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
             meeting_id = (event.get("meeting") or {}).get("id")
             log.info("Webhook received: event=%s meeting=%s", event_type, meeting_id)
 
