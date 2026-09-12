@@ -134,6 +134,13 @@ def clone_workflow_template(project_id, project_name, owner=""):
     # task visible in one grouped view while retaining the old tables as a
     # compatibility fallback during migration.
     if DELIVERY_TABLE_ID:
+        # Automation retries must be idempotent.  Do not clone the same
+        # template into a project that already has delivery items.
+        existing_rows = bitable_list(DELIVERY_TABLE_ID)
+        project_key = normalize_name(project_name)
+        if any(normalize_name((r.get("fields") or {}).get("Project")) == project_key for r in existing_rows):
+            log.info("Delivery template already exists for %s; skipping clone", project_name)
+            return
         created = {}
         for row in rows:
             f = row.get("fields") or {}
@@ -257,7 +264,22 @@ def find_project_id(project_name):
 
 def latest_project_record():
     rows = bitable_list(PROJECTS_TABLE_ID)
-    return max(rows, key=lambda row: row.get("created_time", 0) or 0) if rows else {}
+    def timestamp(row):
+        for key in ("created_time", "last_modified_time"):
+            value = row.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                try:
+                    return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+        return 0.0
+    # The API normally supplies timestamps; when it does not, list order is
+    # the only reliable signal and the last record is the newly added one.
+    return max(enumerate(rows), key=lambda item: (timestamp(item[1]), item[0]))[1] if rows else {}
 
 def handle_project_created(event):
     """Clone the standard workflow after a Base Project record is created."""
