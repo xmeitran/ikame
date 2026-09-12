@@ -151,7 +151,7 @@ def clone_workflow_template(project_id, project_name, owner=""):
                     "PIC": owner,
                     "Sequence": f.get("Sequence") or 0,
                     "Template Source": "21-day master",
-                    "Progress %": "0",
+                    "Progress %": 0,
                 }
                 milestone_id = bitable_create(DELIVERY_TABLE_ID, mf)
                 created[milestone] = milestone_id
@@ -165,7 +165,7 @@ def clone_workflow_template(project_id, project_name, owner=""):
                     "Sequence": f.get("Sequence") or 0,
                     "Priority": field_text(f.get("Default Priority")) or "Medium",
                     "Template Source": "21-day master",
-                    "Progress %": "0",
+                    "Progress %": 0,
                 }
                 if milestone_id:
                     tf["Parent Item"] = milestone
@@ -316,7 +316,7 @@ def update_delivery_progress(plan, meeting_title=""):
                 "Needs Review": "No",
             }
             if milestone.get("progress_percent") is not None:
-                fields["Progress %"] = str(milestone.get("progress_percent"))
+                fields["Progress %"] = milestone.get("progress_percent")
             if milestone.get("risk"):
                 fields["Risk / Blocker"] = milestone.get("risk")
             try:
@@ -343,7 +343,7 @@ def update_delivery_progress(plan, meeting_title=""):
                     "Needs Review": "No",
                 }
                 if task.get("progress_percent") is not None:
-                    fields["Progress %"] = str(task.get("progress_percent"))
+                    fields["Progress %"] = task.get("progress_percent")
                 if task.get("risk"):
                     fields["Risk / Blocker"] = task.get("risk")
                 if task_row:
