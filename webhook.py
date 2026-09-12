@@ -26,6 +26,8 @@ BASE_TOKEN = os.getenv("BITABLE_APP_TOKEN")
 TABLE_ID = os.getenv("MEETINGS_TABLE_ID")
 PROJECTS_TABLE_ID = os.getenv("PROJECTS_TABLE_ID")
 TASKS_TABLE_ID = os.getenv("TASKS_TABLE_ID")
+MILESTONES_TABLE_ID = os.getenv("MILESTONES_TABLE_ID")
+WORKFLOW_TABLE_ID = os.getenv("WORKFLOW_TABLE_ID")
 CODEX_BIN = os.getenv("CODEX_BIN", "/Applications/ChatGPT.app/Contents/Resources/codex")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
@@ -87,8 +89,11 @@ def create_minute_record(event, minute_token, transcript):
     r = requests.post(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json={"fields": fields}, timeout=30)
     if r.status_code >= 300:
         raise RuntimeError(f"Base create failed {r.status_code}: {r.text[:500]}")
+    record_id = (r.json().get("data") or {}).get("record", {}).get("record_id", "")
     log.info("Base record created from generated Minutes %s", minute_token)
-    create_project_and_tasks(event, fields["Meeting Title"], transcript)
+    plan = create_project_and_tasks(event, fields["Meeting Title"], transcript)
+    if record_id and plan:
+        bitable_update(TABLE_ID, record_id, plan_to_meeting_fields(plan))
 
 def bitable_create(table_id, fields):
     if not table_id:
@@ -98,6 +103,134 @@ def bitable_create(table_id, fields):
     if r.status_code >= 300:
         raise RuntimeError(f"Base create failed {r.status_code}: {r.text[:500]}")
     return (r.json().get("data") or {}).get("record", {}).get("record_id", "")
+
+def bitable_list(table_id, page_size=500):
+    """Read Base records for matching existing projects and workflow templates."""
+    if not table_id:
+        return []
+    url = f"{DOMAIN}/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records"
+    r = requests.get(url, params={"page_size": page_size}, headers={"Authorization": f"Bearer {tenant_token()}"}, timeout=30)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Base list failed {r.status_code}: {r.text[:500]}")
+    return (r.json().get("data") or {}).get("items", [])
+
+def field_text(value):
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return ", ".join(field_text(item) for item in value).strip(", ")
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("name") or value.get("value") or "").strip()
+    return str(value or "").strip()
+
+def clone_workflow_template(project_id, project_name, owner=""):
+    """Instantiate the 21-day template for a newly created project."""
+    if not WORKFLOW_TABLE_ID or not MILESTONES_TABLE_ID or not project_id:
+        return
+    rows = bitable_list(WORKFLOW_TABLE_ID)
+    for row in rows:
+        f = row.get("fields") or {}
+        milestone = field_text(f.get("Milestone")) or field_text(f.get("Phase"))
+        if not milestone:
+            continue
+        milestone_fields = {
+            "Milestone / Phase": milestone,
+            "Project": [{"record_id": project_id}],
+            "Phase Type": field_text(f.get("Phase")) or "Production",
+            "Sequence": f.get("Sequence") or 0,
+            "Status": "Upcoming",
+            "PIC": owner,
+            "Go-live Gate": field_text(f.get("Go-live Gate")) or "No",
+            "Progress %": 0,
+            "Next Action": field_text(f.get("Task Template")) or "Start milestone",
+        }
+        try:
+            milestone_id = bitable_create(MILESTONES_TABLE_ID, milestone_fields)
+        except Exception as exc:
+            log.warning("Milestone project link failed, retrying as text: %s", exc)
+            milestone_fields["Project"] = project_name
+            milestone_id = bitable_create(MILESTONES_TABLE_ID, milestone_fields)
+        task_title = field_text(f.get("Task Template"))
+        if TASKS_TABLE_ID and task_title:
+            task_fields = {
+                "Task name": task_title,
+                "Owner": ([{"id": owner}] if owner else []),
+                "Description": f"Template 21 ngày — {project_name} — {milestone}",
+                "Project": [{"record_id": project_id}],
+            }
+            offset = f.get("Offset Day")
+            duration = f.get("Duration Days")
+            if isinstance(offset, (int, float)):
+                start = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=int(offset))
+                task_fields["Start Date"] = int(start.timestamp() * 1000)
+                if isinstance(duration, (int, float)):
+                    task_fields["Deadline"] = int((start + datetime.timedelta(days=int(duration))).timestamp() * 1000)
+            try:
+                bitable_create(TASKS_TABLE_ID, task_fields)
+            except Exception as exc:
+                log.warning("Template task link failed, retrying without Project: %s", exc)
+                task_fields.pop("Project", None)
+                bitable_create(TASKS_TABLE_ID, task_fields)
+    log.info("Cloned %d workflow template row(s) for project %s", len(rows), project_name)
+
+def find_project_id(project_name):
+    target = re.sub(r"\s+", " ", (project_name or "").strip().casefold())
+    if not target:
+        return ""
+    for row in bitable_list(PROJECTS_TABLE_ID):
+        current = field_text((row.get("fields") or {}).get("Project Name"))
+        if re.sub(r"\s+", " ", current.casefold()) == target:
+            return row.get("record_id", "")
+    return ""
+
+def bitable_update(table_id, record_id, fields):
+    if not table_id or not record_id or not fields:
+        return
+    url = f"{DOMAIN}/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records/{record_id}"
+    r = requests.put(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json={"fields": fields}, timeout=30)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Base update failed {r.status_code}: {r.text[:500]}")
+
+def plan_to_meeting_fields(plan):
+    tasks = flatten_plan_tasks(plan)
+    items = []
+    for task in tasks:
+        items.append("Task: {0} | PIC: {1} | Due: {2} | Priority: {3} | Milestone: {4}".format(
+            task.get("title") or "NEEDS_REVIEW",
+            task.get("owner") or "NEEDS_REVIEW",
+            task.get("deadline") or "NEEDS_REVIEW",
+            task.get("priority") or "Medium",
+            task.get("milestone") or "",
+        ))
+    decisions = plan.get("decisions") or []
+    decisions_text = decisions if isinstance(decisions, str) else "\n".join(str(item) for item in decisions)
+    return {
+        "AI Summary": plan.get("summary_vi") or plan.get("meeting_summary_vi") or "",
+        "Key Decisions": decisions_text,
+        "Extracted Action Items": "\n".join(items),
+        "AI Processing Status": "AI Draft Generated",
+        "Ingestion Status": "Imported — AI processed",
+    }
+
+def flatten_plan_tasks(plan):
+    """Flatten portfolio-style AI output while keeping legacy output compatible."""
+    if isinstance(plan.get("projects"), list):
+        flattened = []
+        for project in plan["projects"]:
+            project_name = project.get("project") or project.get("name") or ""
+            for milestone in project.get("milestones") or []:
+                milestone_name = milestone.get("milestone") or milestone.get("name") or ""
+                for task in milestone.get("tasks") or []:
+                    item = dict(task)
+                    item.setdefault("project", project_name)
+                    item.setdefault("milestone", milestone_name)
+                    flattened.append(item)
+            for task in project.get("tasks") or []:
+                item = dict(task)
+                item.setdefault("project", project_name)
+                flattened.append(item)
+        return flattened
+    return list(plan.get("tasks") or [])
 
 def participant_ids(event):
     """Collect user open_ids from an event, excluding duplicates."""
@@ -122,10 +255,10 @@ def participant_ids(event):
 def extraction_prompt(transcript):
     """Prompt shared by the hosted API and the optional local Codex fallback."""
     return f'''Đọc transcript cuộc họp dưới đây. Trả về DUY NHẤT JSON hợp lệ, không markdown:
-{{"project":"Tên dự án ngắn","milestone":"Tên milestone hoặc giai đoạn, nếu có","summary_vi":"Tóm tắt tiếng Việt chuẩn","tasks":[{{"title":"việc cần làm","description":"mô tả rõ","owner":"tên người nếu transcript nói rõ, nếu không để rỗng","deadline":"YYYY-MM-DD nếu có, nếu không để rỗng","priority":"High|Medium|Low","milestone":"milestone của task nếu có"}}]}}
+{{"meeting_summary_vi":"Tóm tắt toàn bộ cuộc họp bằng tiếng Việt chuẩn","decisions":["quyết định quan trọng"],"projects":[{{"project":"Tên project đúng như transcript","status":"Current status","health":"On track|At risk|Blocked|Unknown","summary_vi":"Tình hình project","next_step":"Bước tiếp theo của project","milestones":[{{"milestone":"Tên milestone","status":"Current milestone status","next_step":"Bước tiếp theo của milestone","tasks":[{{"title":"việc cần làm","description":"mô tả rõ","owner":"tên người nếu nói rõ, nếu không để rỗng","deadline":"YYYY-MM-DD nếu có, nếu không để rỗng","priority":"High|Medium|Low"}}]}}]}}]}}
 Không bịa tên người hoặc deadline. Sửa lỗi chính tả và dịch sang tiếng Việt tự nhiên.
 TRANSCRIPT:
-{transcript[:12000]}'''
+{transcript[:50000]}'''
 
 def openai_plan(transcript):
     """Use OpenAI Responses API for production transcript extraction."""
@@ -143,7 +276,7 @@ def openai_plan(transcript):
         match = re.search(r"\{.*\}", output, re.S)
         if match:
             data = json.loads(match.group(0))
-            if isinstance(data.get("tasks"), list):
+            if isinstance(data.get("tasks"), list) or isinstance(data.get("projects"), list):
                 log.info("Transcript extracted with OpenAI model %s", OPENAI_MODEL)
                 return data
     except Exception as exc:
@@ -161,47 +294,65 @@ def codex_plan(transcript):
         match = re.search(r"\{.*\}", output, re.S)
         if match:
             data = json.loads(match.group(0))
-            if isinstance(data.get("tasks"), list):
+            if isinstance(data.get("tasks"), list) or isinstance(data.get("projects"), list):
                 return data
     except Exception as exc:
         log.warning("Codex extraction unavailable; using fallback: %s", exc)
     return {"project": "Lark meeting project", "summary_vi": transcript[:5000], "tasks": []}
 
 def create_project_and_tasks(event, title, transcript):
-    """Create one project and one task per participant for a meeting recap."""
+    """Create a project and one Base task per extracted action item.
+
+    The webhook is the single owner of task creation.  AI-provided owners are
+    used only when they are already Lark open_ids; otherwise we fall back to
+    the meeting owner/participant so a task is never silently dropped.
+    """
     if not PROJECTS_TABLE_ID or not TASKS_TABLE_ID:
         log.warning("Project/task table IDs are not configured; skipping task creation")
-        return
+        return {"project": title, "tasks": []}
     plan = openai_plan(transcript) or codex_plan(transcript)
-    project_name = plan.get("project") or title or "Lark meeting project"
-    milestone = plan.get("milestone") or ""
-    project_id = bitable_create(PROJECTS_TABLE_ID, {"Project Name": project_name})
     owners = participant_ids(event)
-    if not owners:
-        log.warning("No participant open_ids found; project %s created without tasks", project_id)
-        return
-    tasks = plan.get("tasks") or [{"title": "Xem lại recap cuộc họp", "description": plan.get("summary_vi", transcript or ""), "priority": "Medium"}]
-    for index, task in enumerate(tasks, 1):
-        owner = owners[(index - 1) % len(owners)]
-        task_fields = {
-            "Task name": (f"[{task.get('milestone') or milestone}] " if (task.get('milestone') or milestone) else "") + (task.get("title") or f"Follow up meeting recap — {project_name} ({index})"),
-            "Owner": [{"id": owner}],
-            "Description": (("Milestone: " + (task.get("milestone") or milestone) + "\n") if (task.get("milestone") or milestone) else "") + (task.get("description") or plan.get("summary_vi") or transcript or ""),
-        }
-        deadline = task.get("deadline") or ""
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", deadline):
-            task_fields["Deadline"] = int(datetime.datetime.strptime(deadline, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
-        if project_id:
-            task_fields["Project"] = [{"record_id": project_id}]
-        try:
-            bitable_create(TASKS_TABLE_ID, task_fields)
-        except Exception as exc:
-            # A linked-record field may be configured differently across Bases;
-            # still create the task with the portable fields.
-            log.warning("Task link failed for owner %s, retrying without Project: %s", owner, exc)
-            task_fields.pop("Project", None)
-            bitable_create(TASKS_TABLE_ID, task_fields)
-    log.info("Created project %s and %d participant task(s)", project_id, len(owners))
+    meeting_owner = ((event.get("meeting") or {}).get("owner") or {}).get("id", {})
+    fallback_owner = meeting_owner.get("open_id") if isinstance(meeting_owner, dict) else ""
+    fallback_owner = fallback_owner or (owners[0] if owners else "")
+    projects = plan.get("projects") if isinstance(plan.get("projects"), list) else [{"project": plan.get("project") or title, "milestone": plan.get("milestone"), "tasks": plan.get("tasks") or []}]
+    total_tasks = 0
+    for project in projects:
+        project_name = project.get("project") or project.get("name") or title or "Lark meeting project"
+        project_id = find_project_id(project_name)
+        if not project_id:
+            project_id = bitable_create(PROJECTS_TABLE_ID, {"Project Name": project_name})
+            clone_workflow_template(project_id, project_name, fallback_owner)
+        else:
+            log.info("Matched existing project %s (%s); skipping template clone", project_name, project_id)
+        project_tasks = []
+        if project.get("milestone"):
+            project_tasks = project.get("tasks") or []
+        else:
+            for milestone in project.get("milestones") or []:
+                for task in milestone.get("tasks") or []:
+                    item = dict(task); item.setdefault("milestone", milestone.get("milestone") or milestone.get("name") or ""); project_tasks.append(item)
+            project_tasks.extend(project.get("tasks") or [])
+        for task in project_tasks:
+            task_title = str(task.get("title") or "").strip()
+            if not task_title:
+                continue
+            ai_owner = str(task.get("owner") or "").strip()
+            owner = ai_owner if ai_owner.startswith("ou_") else fallback_owner
+            task_fields = {"Task name": task_title, "Owner": ([{"id": owner}] if owner else []), "Description": task.get("description") or plan.get("summary_vi") or plan.get("meeting_summary_vi") or transcript or ""}
+            deadline = task.get("deadline") or ""
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", deadline):
+                task_fields["Deadline"] = int(datetime.datetime.strptime(deadline, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+            if project_id:
+                task_fields["Project"] = [{"record_id": project_id}]
+            try:
+                bitable_create(TASKS_TABLE_ID, task_fields)
+            except Exception as exc:
+                log.warning("Task link failed, retrying without Project: %s", exc)
+                task_fields.pop("Project", None); bitable_create(TASKS_TABLE_ID, task_fields)
+            total_tasks += 1
+    log.info("Created %d project(s) and %d extracted task(s)", len(projects), total_tasks)
+    return plan
 
 def oauth_url():
     if not OAUTH_REDIRECT_URI:
@@ -280,8 +431,11 @@ def create_forwarded_minutes_record(event, minute_url):
     r = requests.post(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json={"fields": fields}, timeout=30)
     if r.status_code >= 300:
         raise RuntimeError(f"Base create failed {r.status_code}: {r.text[:500]}")
+    record_id = (r.json().get("data") or {}).get("record", {}).get("record_id", "")
     log.info("Base record created from forwarded Minutes link for event %s", event_id)
-    create_project_and_tasks(event, fields["Meeting Title"], transcript)
+    plan = create_project_and_tasks(event, fields["Meeting Title"], transcript)
+    if record_id and plan:
+        bitable_update(TABLE_ID, record_id, plan_to_meeting_fields(plan))
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
