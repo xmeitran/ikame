@@ -32,6 +32,8 @@ DELIVERY_TABLE_ID = os.getenv("DELIVERY_TABLE_ID")
 CODEX_BIN = os.getenv("CODEX_BIN", "/Applications/ChatGPT.app/Contents/Resources/codex")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 DOMAIN = os.getenv("LARK_DOMAIN", "https://open.larksuite.com")
 OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "")
 OAUTH_STATE = secrets.token_urlsafe(24)
@@ -470,6 +472,34 @@ def openai_plan(transcript):
         log.warning("OpenAI extraction unavailable; trying Codex fallback: %s", exc)
     return None
 
+def gemini_plan(transcript):
+    """Use Gemini generateContent when a Gemini key is configured."""
+    if not GEMINI_API_KEY or not transcript:
+        return None
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(GEMINI_MODEL, safe='')}:generateContent"
+        response = requests.post(
+            url,
+            params={"key": GEMINI_API_KEY},
+            json={
+                "contents": [{"parts": [{"text": extraction_prompt(transcript)}]}],
+                "generationConfig": {"responseMimeType": "application/json"},
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        output = data["candidates"][0]["content"]["parts"][0].get("text", "").strip()
+        match = re.search(r"\{.*\}", output, re.S)
+        if match:
+            plan = json.loads(match.group(0))
+            if isinstance(plan.get("projects"), list) or isinstance(plan.get("tasks"), list):
+                log.info("Transcript extracted with Gemini model %s", GEMINI_MODEL)
+                return plan
+    except Exception as exc:
+        log.warning("Gemini extraction unavailable; trying OpenAI/Codex fallback: %s", exc)
+    return None
+
 def codex_plan(transcript):
     """Normalize Vietnamese transcript and extract a strict project/task plan."""
     if not transcript:
@@ -497,7 +527,7 @@ def create_project_and_tasks(event, title, transcript):
     if not PROJECTS_TABLE_ID or (not TASKS_TABLE_ID and not DELIVERY_TABLE_ID):
         log.warning("Project/task table IDs are not configured; skipping task creation")
         return {"project": title, "tasks": []}
-    plan = openai_plan(transcript) or codex_plan(transcript)
+    plan = gemini_plan(transcript) or openai_plan(transcript) or codex_plan(transcript)
     owners = participant_ids(event)
     meeting_owner = ((event.get("meeting") or {}).get("owner") or {}).get("id", {})
     fallback_owner = meeting_owner.get("open_id") if isinstance(meeting_owner, dict) else ""
