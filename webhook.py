@@ -38,6 +38,8 @@ DOMAIN = os.getenv("LARK_DOMAIN", "https://open.larksuite.com")
 OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "")
 OAUTH_STATE = secrets.token_urlsafe(24)
 OAUTH_TOKEN_FILE = os.path.join(os.path.dirname(__file__), ".oauth_token.json")
+PROCESSED_EVENTS = set()
+PROCESSED_EVENTS_LOCK = threading.Lock()
 
 def tenant_token():
     r = requests.post(f"{DOMAIN}/open-apis/auth/v3/tenant_access_token/internal", json={"app_id": APP_ID, "app_secret": APP_SECRET}, timeout=20)
@@ -477,16 +479,21 @@ def gemini_plan(transcript):
     if not GEMINI_API_KEY or not transcript:
         return None
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(GEMINI_MODEL, safe='')}:generateContent"
+        body = {
+            "contents": [{"parts": [{"text": extraction_prompt(transcript)}]}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        model_path = urllib.parse.quote(GEMINI_MODEL, safe='')
         response = requests.post(
-            url,
-            params={"key": GEMINI_API_KEY},
-            json={
-                "contents": [{"parts": [{"text": extraction_prompt(transcript)}]}],
-                "generationConfig": {"responseMimeType": "application/json"},
-            },
-            timeout=60,
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model_path}:generateContent",
+            params={"key": GEMINI_API_KEY}, json=body, timeout=60,
         )
+        # Some Google API keys expose the model through v1 rather than v1beta.
+        if response.status_code == 404:
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1/models/{model_path}:generateContent",
+                params={"key": GEMINI_API_KEY}, json=body, timeout=60,
+            )
         response.raise_for_status()
         data = response.json()
         output = data["candidates"][0]["content"]["parts"][0].get("text", "").strip()
@@ -750,6 +757,13 @@ class Handler(BaseHTTPRequestHandler):
             # The app also receives chat messages.  They are only a health check
             # for the bot unless the user forwards a Lark Minutes link.
             if event_type == "im.message.receive_v1":
+                event_id = event.get("_event_id", "unknown")
+                with PROCESSED_EVENTS_LOCK:
+                    if event_id != "unknown" and event_id in PROCESSED_EVENTS:
+                        log.info("Skipping duplicate webhook event %s", event_id)
+                        self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+                    if event_id != "unknown":
+                        PROCESSED_EVENTS.add(event_id)
                 minute_url = extract_minutes_url(event)
                 if not minute_url:
                     message = event.get("message") or {}
