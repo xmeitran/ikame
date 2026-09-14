@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import subprocess
+import shutil
 import datetime
 import threading
 import urllib.parse
@@ -29,7 +30,10 @@ TASKS_TABLE_ID = os.getenv("TASKS_TABLE_ID")
 MILESTONES_TABLE_ID = os.getenv("MILESTONES_TABLE_ID")
 WORKFLOW_TABLE_ID = os.getenv("WORKFLOW_TABLE_ID")
 DELIVERY_TABLE_ID = os.getenv("DELIVERY_TABLE_ID")
-CODEX_BIN = os.getenv("CODEX_BIN", "/Applications/ChatGPT.app/Contents/Resources/codex")
+CODEX_BIN = os.getenv("CODEX_BIN") or shutil.which("codex") or "/Applications/ChatGPT.app/Contents/Resources/codex"
+# Local development uses the authenticated Codex CLI by default.  Hosted
+# environments can set AI_PROVIDER explicitly (or fall back to API providers).
+AI_PROVIDER = os.getenv("AI_PROVIDER", "codex" if shutil.which("codex") else "auto").strip().lower()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -451,6 +455,21 @@ Không bịa tên người hoặc deadline. Sửa lỗi chính tả và dịch s
 TRANSCRIPT:
 {transcript[:50000]}'''
 
+def parse_plan_output(output):
+    """Find the last valid plan object in CLI/API output that may contain logs."""
+    if not output:
+        return None
+    decoder = json.JSONDecoder()
+    candidates = []
+    for match in re.finditer(r"\{", output):
+        try:
+            value, _ = decoder.raw_decode(output[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and (isinstance(value.get("projects"), list) or isinstance(value.get("tasks"), list)):
+            candidates.append(value)
+    return candidates[-1] if candidates else None
+
 def openai_plan(transcript):
     """Use OpenAI Responses API for production transcript extraction."""
     if not OPENAI_API_KEY or not transcript:
@@ -464,12 +483,10 @@ def openai_plan(transcript):
             store=False,
         )
         output = (response.output_text or "").strip()
-        match = re.search(r"\{.*\}", output, re.S)
-        if match:
-            data = json.loads(match.group(0))
-            if isinstance(data.get("tasks"), list) or isinstance(data.get("projects"), list):
-                log.info("Transcript extracted with OpenAI model %s", OPENAI_MODEL)
-                return data
+        data = parse_plan_output(output)
+        if data:
+            log.info("Transcript extracted with OpenAI model %s", OPENAI_MODEL)
+            return data
     except Exception as exc:
         log.warning("OpenAI extraction unavailable; trying Codex fallback: %s", exc)
     return None
@@ -497,12 +514,10 @@ def gemini_plan(transcript):
         response.raise_for_status()
         data = response.json()
         output = data["candidates"][0]["content"]["parts"][0].get("text", "").strip()
-        match = re.search(r"\{.*\}", output, re.S)
-        if match:
-            plan = json.loads(match.group(0))
-            if isinstance(plan.get("projects"), list) or isinstance(plan.get("tasks"), list):
-                log.info("Transcript extracted with Gemini model %s", GEMINI_MODEL)
-                return plan
+        plan = parse_plan_output(output)
+        if plan:
+            log.info("Transcript extracted with Gemini model %s", GEMINI_MODEL)
+            return plan
     except Exception as exc:
         log.warning("Gemini extraction unavailable; trying OpenAI/Codex fallback: %s", exc)
     return None
@@ -513,13 +528,15 @@ def codex_plan(transcript):
         return {"project": "Lark meeting project", "tasks": []}
     prompt = extraction_prompt(transcript)
     try:
-        result = subprocess.run([CODEX_BIN, "exec", "--ephemeral", "--skip-git-repo-check", prompt], capture_output=True, text=True, timeout=60)
-        output = (result.stdout or "").strip()
-        match = re.search(r"\{.*\}", output, re.S)
-        if match:
-            data = json.loads(match.group(0))
-            if isinstance(data.get("tasks"), list) or isinstance(data.get("projects"), list):
-                return data
+        result = subprocess.run(
+            [CODEX_BIN, "exec", "--ephemeral", "--skip-git-repo-check", "-"],
+            input=prompt, capture_output=True, text=True, timeout=180,
+        )
+        output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        data = parse_plan_output(output)
+        if data:
+            log.info("Transcript extracted with local Codex CLI")
+            return data
     except Exception as exc:
         log.warning("Codex extraction unavailable; using fallback: %s", exc)
     return {"project": "Lark meeting project", "summary_vi": transcript[:5000], "tasks": []}
@@ -534,7 +551,14 @@ def create_project_and_tasks(event, title, transcript):
     if not PROJECTS_TABLE_ID or (not TASKS_TABLE_ID and not DELIVERY_TABLE_ID):
         log.warning("Project/task table IDs are not configured; skipping task creation")
         return {"project": title, "tasks": []}
-    plan = gemini_plan(transcript) or openai_plan(transcript) or codex_plan(transcript)
+    providers = {
+        "codex": [codex_plan],
+        "gemini": [gemini_plan],
+        "openai": [openai_plan],
+        "auto": [gemini_plan, openai_plan, codex_plan],
+    }.get(AI_PROVIDER, [codex_plan])
+    plan = next((candidate for provider in providers if (candidate := provider(transcript))), None)
+    plan = plan or {"project": title, "tasks": []}
     owners = participant_ids(event)
     meeting_owner = ((event.get("meeting") or {}).get("owner") or {}).get("id", {})
     fallback_owner = meeting_owner.get("open_id") if isinstance(meeting_owner, dict) else ""
