@@ -517,7 +517,9 @@ def sync_project_from_delivery(project_name):
     # These fields are optional during migration; retry with only fields that
     # are present in the Projects table if the Base schema is still old.
     try:
-        bitable_update(PROJECTS_TABLE_ID, project_id, {"Status": status, "Progress %": pct, "Current Milestone": current_milestone, "Current Stage": current_stage, "Next Action": next_action, "Last Updated": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)})
+        # Progress % is a Base formula (average of Delivery Plan progress,
+        # normalized from 0–100 to 0–1); never write into the formula field.
+        bitable_update(PROJECTS_TABLE_ID, project_id, {"Status": status, "Current Milestone": current_milestone, "Current Stage": current_stage, "Next Action": next_action, "Last Updated": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)})
     except Exception as exc:
         log.warning("Project roll-up update skipped for %s (add Progress %%/Last Updated fields if needed): %s", project_name, exc)
     log.info("Synced project %s progress to %s%% (%s)", project_name, pct, status)
