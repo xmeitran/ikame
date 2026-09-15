@@ -30,6 +30,12 @@ TASKS_TABLE_ID = os.getenv("TASKS_TABLE_ID")
 MILESTONES_TABLE_ID = os.getenv("MILESTONES_TABLE_ID")
 WORKFLOW_TABLE_ID = os.getenv("WORKFLOW_TABLE_ID")
 DELIVERY_TABLE_ID = os.getenv("DELIVERY_TABLE_ID")
+MEMBERS_TABLE_ID = os.getenv("MEMBERS_TABLE_ID", "tblsxyYYcbp9dpUS")
+PROGRESS_CHAT_ID = os.getenv("PROGRESS_CHAT_ID", "").strip()
+PROGRESS_NOTIFY_ENABLED = os.getenv("PROGRESS_NOTIFY_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+DAILY_PROGRESS_CHAT_ID = os.getenv("DAILY_PROGRESS_CHAT_ID", "").strip()
+DAILY_PROGRESS_HOUR = int(os.getenv("DAILY_PROGRESS_HOUR", "9"))
+DAILY_PROGRESS_ENABLED = os.getenv("DAILY_PROGRESS_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
 CODEX_BIN = os.getenv("CODEX_BIN") or shutil.which("codex") or "/Applications/ChatGPT.app/Contents/Resources/codex"
 # Local development uses the authenticated Codex CLI by default.  Hosted
 # environments can set AI_PROVIDER explicitly (or fall back to API providers).
@@ -44,6 +50,8 @@ OAUTH_STATE = secrets.token_urlsafe(24)
 OAUTH_TOKEN_FILE = os.path.join(os.path.dirname(__file__), ".oauth_token.json")
 PROCESSED_EVENTS = set()
 PROCESSED_EVENTS_LOCK = threading.Lock()
+PROCESSED_MINUTES = set()
+PROCESSING_MINUTES = set()
 
 def tenant_token():
     r = requests.post(f"{DOMAIN}/open-apis/auth/v3/tenant_access_token/internal", json={"app_id": APP_ID, "app_secret": APP_SECRET}, timeout=20)
@@ -55,6 +63,46 @@ def user_token():
         with open(OAUTH_TOKEN_FILE, encoding="utf-8") as fh:
             return json.load(fh)["access_token"]
     except (OSError, KeyError):
+        return ""
+
+def refresh_user_token():
+    """Refresh the stored Lark OAuth user token when its short TTL expires."""
+    try:
+        with open(OAUTH_TOKEN_FILE, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        refresh_token = saved.get("refresh_token", "")
+        if not refresh_token:
+            return ""
+        r = requests.post(
+            f"{DOMAIN}/open-apis/authen/v1/refresh_access_token",
+            json={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "app_id": APP_ID,
+                "app_secret": APP_SECRET,
+            },
+            timeout=20,
+        )
+        if r.status_code >= 300:
+            log.warning("Lark OAuth refresh failed: %s %s", r.status_code, r.text[:300])
+            return ""
+        body = r.json()
+        if body.get("code", 0) not in (0, None):
+            log.warning("Lark OAuth refresh rejected: %s", body.get("msg", body.get("code")))
+            return ""
+        data = body.get("data", body)
+        if not data.get("access_token"):
+            return ""
+        # Keep the newest refresh token and any identity metadata returned by
+        # the original authorization response.
+        merged = dict(saved)
+        merged.update(data)
+        with open(OAUTH_TOKEN_FILE, "w", encoding="utf-8") as fh:
+            json.dump(merged, fh)
+        log.info("Lark OAuth user token refreshed")
+        return data["access_token"]
+    except Exception as exc:
+        log.warning("Lark OAuth refresh unavailable: %s", exc)
         return ""
 
 def find_value(obj, names):
@@ -77,12 +125,54 @@ def fetch_transcript(minute_token):
     if not token:
         raise RuntimeError("No OAuth user token; open /oauth/start first")
     url = f"{DOMAIN}/open-apis/minutes/v1/minutes/{urllib.parse.quote(minute_token, safe='')}/transcript"
-    r = requests.get(url, params={"need_speaker": "true", "need_timestamp": "true", "file_format": "txt"}, headers={"Authorization": f"Bearer {token}"}, timeout=45)
+    params = {"need_speaker": "true", "need_timestamp": "true", "file_format": "txt"}
+    r = requests.get(url, params=params, headers={"Authorization": f"Bearer {token}"}, timeout=45)
+    if r.status_code == 401:
+        refreshed = refresh_user_token()
+        if refreshed:
+            r = requests.get(url, params=params, headers={"Authorization": f"Bearer {refreshed}"}, timeout=45)
     r.raise_for_status()
     if "application/json" in r.headers.get("content-type", ""):
         data = r.json().get("data", r.json())
         return data.get("content", "") if isinstance(data, dict) else str(data)
-    return r.text
+    # Lark may omit charset on transcript responses.  Decode the bytes as
+    # UTF-8 explicitly; requests otherwise guesses latin-1 and corrupts
+    # Vietnamese (e.g. "cái" becomes "cÃ¡i").
+    return r.content.decode("utf-8", errors="replace")
+
+def fetch_minutes_metadata(minute_token):
+    """Return best-effort title/participant metadata for a Minutes item."""
+    token = user_token()
+    if not token or not minute_token:
+        return {}
+    url = f"{DOMAIN}/open-apis/minutes/v1/minutes/{urllib.parse.quote(minute_token, safe='')}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if r.status_code >= 300:
+            return {}
+        payload = r.json()
+        data = payload.get("data", payload)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        log.info("Minutes metadata unavailable for %s: %s", minute_token, exc)
+        return {}
+
+def minutes_title_and_participants(minute_token):
+    metadata = fetch_minutes_metadata(minute_token)
+    title = find_value(metadata, {"title", "topic", "meeting_title", "name"})
+    participants = []
+    def walk(value):
+        if isinstance(value, dict):
+            oid = value.get("open_id")
+            if isinstance(oid, str) and oid and oid not in participants:
+                participants.append(oid)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+    walk(metadata)
+    return title, participants
 
 def create_minute_record(event, minute_token, transcript):
     event_id = event.get("_event_id", "unknown")
@@ -98,20 +188,33 @@ def create_minute_record(event, minute_token, transcript):
     r = requests.post(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json={"fields": fields}, timeout=30)
     if r.status_code >= 300:
         raise RuntimeError(f"Base create failed {r.status_code}: {r.text[:500]}")
-    record_id = (r.json().get("data") or {}).get("record", {}).get("record_id", "")
+    body = r.json()
+    if body.get("code", 0) not in (0, None):
+        raise RuntimeError(f"Base create failed {body.get('code')}: {body.get('msg', '')}")
+    record_id = (body.get("data") or {}).get("record", {}).get("record_id", "")
     log.info("Base record created from generated Minutes %s", minute_token)
     plan = create_project_and_tasks(event, fields["Meeting Title"], transcript)
     if record_id and plan:
         bitable_update(TABLE_ID, record_id, plan_to_meeting_fields(plan))
+    send_progress_card(event, plan, fields["Meeting Title"], transcript)
 
 def bitable_create(table_id, fields):
     if not table_id:
         return ""
+    # Project template cloning must never send a User-type PIC value.  This
+    # guard protects older branches/templates from producing UserFieldConvFail;
+    # meeting task creation assigns PIC explicitly after transcript parsing.
+    if table_id == DELIVERY_TABLE_ID and isinstance(fields, dict) and fields.get("Template Source") == "21-day master":
+        fields = dict(fields)
+        fields.pop("PIC", None)
     url = f"{DOMAIN}/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records"
     r = requests.post(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json={"fields": fields}, timeout=30)
     if r.status_code >= 300:
         raise RuntimeError(f"Base create failed {r.status_code}: {r.text[:500]}")
-    return (r.json().get("data") or {}).get("record", {}).get("record_id", "")
+    body = r.json()
+    if body.get("code", 0) not in (0, None):
+        raise RuntimeError(f"Base create failed {body.get('code')}: {body.get('msg', '')}")
+    return (body.get("data") or {}).get("record", {}).get("record_id", "")
 
 def bitable_list(table_id, page_size=500):
     """Read Base records for matching existing projects and workflow templates."""
@@ -132,11 +235,71 @@ def field_text(value):
         return str(value.get("text") or value.get("name") or value.get("value") or "").strip()
     return str(value or "").strip()
 
+def pic_field(open_id):
+    """Encode an open_id for the Delivery Plan User-type PIC field."""
+    return [{"id": open_id}] if isinstance(open_id, str) and open_id.startswith("ou_") else []
+
+def resolve_pic(task_text="", milestone="", explicit_owner="", fallback_owner=""):
+    """Resolve a PIC from Members & PIC using name/alias/keyword context."""
+    context = normalize_name(f"{task_text} {milestone}")
+    try:
+        members = []
+        for row in bitable_list(MEMBERS_TABLE_ID):
+            f = row.get("fields") or {}
+            active = f.get("Active")
+            if active is False or str(active).casefold() in {"false", "0", "no"}:
+                continue
+            users = f.get("Lark User") or []
+            uid = ""
+            if isinstance(users, list) and users and isinstance(users[0], dict):
+                uid = users[0].get("id") or users[0].get("open_id") or ""
+            uid = uid or (f.get("Lark User") if isinstance(f.get("Lark User"), str) else "")
+            if not uid:
+                continue
+            name = field_text(f.get("Member Name")); aliases = field_text(f.get("Aliases"))
+            if explicit_owner and normalize_name(explicit_owner) in normalize_name(f"{name} {aliases}"):
+                return uid
+            keywords = normalize_name(f.get("Assignment Keywords"))
+            score = sum(1 for token in set(context.split()) if token and token in keywords.split())
+            role = normalize_name(f.get("Role / Function"))
+            # Delivery PIC is the preferred operational fallback; PM is the
+            # second fallback when no more specific keyword is present.
+            role_score = 2 if "project pic" in role else 1 if "project manager" in role else 0
+            members.append((score, role_score, uid))
+        if members:
+            members.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            return members[0][2]
+    except Exception as exc:
+        log.warning("Members & PIC lookup failed: %s", exc)
+    return explicit_owner if explicit_owner.startswith("ou_") else fallback_owner
+
+def stage_for_milestone(milestone):
+    """Canonical iKame 21-day stage labels used by Delivery Plan."""
+    key = normalize_name(milestone)
+    return {
+        "art style": "Art & Concept",
+        "complete prototype": "Prototype",
+        "core game": "Core Game",
+        "prototype handover + testing": "QA & Go-live",
+        "xây dựng tính năng mới": "Core Game",
+    }.get(key, milestone or "")
+
 def clone_workflow_template(project_id, project_name, owner=""):
     """Instantiate the 21-day template for a newly created project."""
     if not WORKFLOW_TABLE_ID or not project_id:
         return
     rows = bitable_list(WORKFLOW_TABLE_ID)
+    # The Base UI may return records in insertion order after a migration.
+    # Always execute the master template chronologically so onboarding and
+    # day-based work are cloned in the intended 21-day sequence.
+    def _template_order(row):
+        f = row.get("fields") or {}
+        try: offset = float(f.get("Offset Day") or 0)
+        except (TypeError, ValueError): offset = 0
+        try: sequence = float(f.get("Sequence") or 0)
+        except (TypeError, ValueError): sequence = 0
+        return (offset, sequence, normalize_name(f.get("Milestone")), normalize_name(f.get("Task Template")))
+    rows.sort(key=_template_order)
     # New CRM design: one operational table, linked to the project, with a
     # self-referencing Parent Item hierarchy.  This keeps every milestone and
     # task visible in one grouped view while retaining the old tables as a
@@ -164,11 +327,16 @@ def clone_workflow_template(project_id, project_name, owner=""):
                     "Project": project_name,
                     "Milestone Group": milestone,
                     "Status": "Upcoming",
-                    "PIC": owner,
                     "Sequence": f.get("Sequence") or 0,
                     "Template Source": "21-day master",
                     "Progress %": 0,
+                    "Stage": field_text(f.get("Stage")) or stage_for_milestone(milestone),
                 }
+                # Do not populate PIC while cloning a new project's template.
+                # Template rows must be created without any User field; PIC is
+                # assigned later when a meeting task is extracted.
+                if project_id:
+                    mf["Project Link"] = [project_id]
                 offset = f.get("Offset Day")
                 duration = f.get("Duration Days")
                 try:
@@ -188,12 +356,16 @@ def clone_workflow_template(project_id, project_name, owner=""):
                     "Project": project_name,
                     "Milestone Group": milestone,
                     "Status": "Upcoming",
-                    "PIC": owner,
                     "Sequence": f.get("Sequence") or 0,
                     "Priority": field_text(f.get("Default Priority")) or "Medium",
                     "Template Source": "21-day master",
                     "Progress %": 0,
+                    "Stage": stage_for_milestone(milestone),
                 }
+                # Likewise, leave template task PIC unset; meeting processing
+                # resolves the responsible member from Base 04.
+                if project_id:
+                    tf["Project Link"] = [project_id]
                 offset = f.get("Offset Day")
                 duration = f.get("Duration Days")
                 try:
@@ -229,6 +401,7 @@ def clone_workflow_template(project_id, project_name, owner=""):
             "PIC": owner,
             "Go-live Gate": field_text(f.get("Go-live Gate")) or "No",
             "Progress %": 0,
+            "Stage": field_text(f.get("Stage")) or stage_for_milestone(milestone),
             "Next Action": field_text(f.get("Task Template")) or "Start milestone",
         }
         try:
@@ -313,6 +486,42 @@ def handle_project_created(event):
     clone_workflow_template(record_id, project_name, owner)
     log.info("Project-created event processed for %s", project_name)
 
+def sync_project_from_delivery(project_name):
+    """Roll up Delivery Plan progress into the matching Projects row."""
+    if not project_name or not PROJECTS_TABLE_ID or not DELIVERY_TABLE_ID:
+        return
+    rows = [r for r in bitable_list(DELIVERY_TABLE_ID) if field_text((r.get("fields") or {}).get("Project")).casefold() == project_name.casefold()]
+    if not rows:
+        return
+    done = {"done", "completed", "complete"}
+    progress = []
+    statuses = []
+    for row in rows:
+        f = row.get("fields") or {}
+        statuses.append(field_text(f.get("Status")).casefold())
+        value = f.get("Progress %")
+        try:
+            if value not in (None, ""): progress.append(float(value))
+        except (TypeError, ValueError):
+            pass
+    pct = round(sum(progress) / len(progress)) if progress else round(sum(s in done for s in statuses) / len(statuses) * 100)
+    status = "Done" if statuses and all(s in done for s in statuses) else "In Progress" if any(s in {"in progress", "doing", "open"} for s in statuses) else "Upcoming"
+    active = next((r for r in rows if field_text((r.get("fields") or {}).get("Status")).casefold() not in done), rows[0])
+    af = active.get("fields") or {}
+    current_milestone = field_text(af.get("Milestone Group")) or field_text(af.get("Parent Item"))
+    current_stage = field_text(af.get("Stage")) or stage_for_milestone(current_milestone)
+    next_action = field_text(af.get("Next Action"))
+    project_id = find_project_id(project_name)
+    if not project_id:
+        return
+    # These fields are optional during migration; retry with only fields that
+    # are present in the Projects table if the Base schema is still old.
+    try:
+        bitable_update(PROJECTS_TABLE_ID, project_id, {"Status": status, "Progress %": pct, "Current Milestone": current_milestone, "Current Stage": current_stage, "Next Action": next_action, "Last Updated": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)})
+    except Exception as exc:
+        log.warning("Project roll-up update skipped for %s (add Progress %%/Last Updated fields if needed): %s", project_name, exc)
+    log.info("Synced project %s progress to %s%% (%s)", project_name, pct, status)
+
 def bitable_update(table_id, record_id, fields):
     if not table_id or not record_id or not fields:
         return
@@ -320,6 +529,9 @@ def bitable_update(table_id, record_id, fields):
     r = requests.put(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json={"fields": fields}, timeout=30)
     if r.status_code >= 300:
         raise RuntimeError(f"Base update failed {r.status_code}: {r.text[:500]}")
+    body = r.json()
+    if body.get("code", 0) not in (0, None):
+        raise RuntimeError(f"Base update failed {body.get('code')}: {body.get('msg', '')}")
 
 def plan_to_meeting_fields(plan):
     tasks = flatten_plan_tasks(plan)
@@ -341,6 +553,120 @@ def plan_to_meeting_fields(plan):
         "AI Processing Status": "AI Draft Generated",
         "Ingestion Status": "Imported — AI processed",
     }
+
+def _progress_chat_id(event):
+    global DAILY_PROGRESS_CHAT_ID
+    message = event.get("message") or {}
+    chat_id = message.get("chat_id") or message.get("chatid") or PROGRESS_CHAT_ID
+    if chat_id and not DAILY_PROGRESS_CHAT_ID:
+        DAILY_PROGRESS_CHAT_ID = chat_id
+        log.info("Using originating group %s for daily progress notifications", chat_id)
+    return chat_id or DAILY_PROGRESS_CHAT_ID
+
+def send_progress_card(event, plan, source_title="", transcript=""):
+    """Post a compact Vietnamese progress card to the originating Lark group."""
+    if not PROGRESS_NOTIFY_ENABLED or not isinstance(plan, dict):
+        return False
+    chat_id = _progress_chat_id(event)
+    if not chat_id:
+        log.info("Progress notification skipped: no group chat_id configured")
+        return False
+    projects = plan.get("projects") if isinstance(plan.get("projects"), list) else [plan]
+    lines = []
+    for project in projects[:8]:
+        name = project.get("project") or project.get("name") or source_title or "Dự án"
+        status = project.get("status") or "Chưa cập nhật"
+        health = project.get("health") or "Unknown"
+        progress = project.get("progress_percent")
+        progress_text = f"{progress}%" if progress is not None else "—"
+        next_step = project.get("next_step") or "Chưa có next action"
+        lines.append(f"**{name}** · {progress_text} · {status} ({health})\nNext: {next_step}")
+    summary = plan.get("summary_vi") or plan.get("meeting_summary_vi") or "Đã cập nhật từ meeting minutes."
+    decisions = plan.get("decisions") or plan.get("key_decisions") or []
+    decisions_text = decisions if isinstance(decisions, str) else "\n".join(f"• {x}" for x in decisions[:8])
+    action_lines = []
+    all_tasks = flatten_plan_tasks(plan)
+    if isinstance(plan.get("tasks"), list): all_tasks.extend(plan.get("tasks") or [])
+    for task in all_tasks[:12]:
+        action_lines.append(f"• **{task.get('title') or task.get('task') or 'Đầu việc'}** · {task.get('owner') or 'Chưa giao'} · {task.get('deadline') or 'Chưa có hạn'} · {task.get('status') or 'Open'} · {task.get('priority') or 'Medium'}")
+    transcript_excerpt = (transcript or plan.get("transcript") or "").strip()
+    if len(transcript_excerpt) > 1400: transcript_excerpt = transcript_excerpt[:1400].rstrip() + "…"
+    card = {"config": {"wide_screen_mode": True}, "header": {"template": "blue", "title": {"tag": "plain_text", "content": "📊 Cập nhật tiến độ dự án"}}, "elements": [
+        {"tag": "markdown", "content": f"**Meeting:** {source_title or 'Meeting minutes'}\n{summary[:800]}"},
+        {"tag": "hr"},
+        {"tag": "markdown", "content": "\n\n".join(lines) if lines else "Chưa trích xuất được tiến độ."},
+        {"tag": "markdown", "content": "**📝 Transcript / nội dung cuộc họp**\n" + (transcript_excerpt or "Không có transcript")},
+        {"tag": "markdown", "content": "**✅ Quyết định chính**\n" + (decisions_text or "Không có quyết định được trích xuất")},
+        {"tag": "markdown", "content": "**📋 Action items chi tiết**\n" + ("\n".join(action_lines) if action_lines else "Không có action item")},
+        {"tag": "note", "elements": [{"tag": "plain_text", "content": "Tự động từ webhook + Codex CLI"}]},
+    ]}
+    url = f"{DOMAIN}/open-apis/im/v1/messages?receive_id_type=chat_id"
+    payload = {"receive_id": chat_id, "msg_type": "interactive", "content": json.dumps(card, ensure_ascii=False)}
+    r = requests.post(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json=payload, timeout=20)
+    if r.status_code >= 300:
+        log.warning("Progress card send failed %s: %s", r.status_code, r.text[:300])
+        return False
+    log.info("Progress card sent to chat %s", chat_id)
+    return True
+
+def send_daily_progress_card():
+    """Send a detailed, executive-style daily report to the configured group."""
+    if not DAILY_PROGRESS_ENABLED or not DAILY_PROGRESS_CHAT_ID or not DELIVERY_TABLE_ID: return False
+    rows = bitable_list(DELIVERY_TABLE_ID)
+    done_status = {"done", "completed", "complete"}
+    today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).date()
+    projects, overdue, due_soon, blockers, next_actions = {}, [], [], [], []
+    for row in rows:
+        f = row.get("fields") or {}; project = field_text(f.get("Project")) or "Chưa gán dự án"
+        item = field_text(f.get("Item Name")) or "Đầu việc"; status = field_text(f.get("Status")) or "Open"
+        p = projects.setdefault(project, {"rows": [], "done": 0, "progress": []}); p["rows"].append(f)
+        if status.casefold() in done_status: p["done"] += 1
+        try:
+            if f.get("Progress %") not in (None, ""): p["progress"].append(int(float(f["Progress %"])))
+        except (TypeError, ValueError): pass
+        due = f.get("Due Date") or f.get("Deadline"); due_date = None
+        if isinstance(due, (int, float)): due_date = datetime.datetime.fromtimestamp(due / 1000, datetime.timezone.utc).date()
+        elif isinstance(due, str):
+            try: due_date = datetime.date.fromisoformat(due[:10])
+            except ValueError: pass
+        pic = field_text(f.get("PIC")) or "Chưa giao"
+        if due_date and status.casefold() not in done_status:
+            line = f"{project} · {item} · PIC: {pic} · {due_date.strftime('%d/%m')}"
+            (overdue if due_date < today else due_soon if due_date <= today + datetime.timedelta(days=2) else []).append(line)
+        risk = field_text(f.get("Risk / Blocker"))
+        if risk: blockers.append(f"{project} · {item}: {risk}")
+        nxt = field_text(f.get("Next Action"))
+        if nxt and status.casefold() not in done_status: next_actions.append(f"{project} · {nxt} · {pic}")
+    total = sum(len(p["rows"]) for p in projects.values()); done = sum(p["done"] for p in projects.values())
+    elements = [{"tag": "markdown", "content": f"**{today.strftime('%A, %d/%m/%Y')}**\n**{len(projects)}** dự án · **{total}** đầu việc · **{done}/{total}** hoàn tất · **{len(overdue)}** quá hạn"}, {"tag": "hr"}]
+    elements.append({"tag": "markdown", "content": "**📌 Tổng quan theo dự án**"})
+    for name, p in list(projects.items())[:12]:
+        avg = round(sum(p["progress"]) / len(p["progress"])) if p["progress"] else round(p["done"] / len(p["rows"]) * 100) if p["rows"] else 0
+        milestones = sum(1 for r in p["rows"] if field_text(r.get("Item Type")).casefold() == "milestone")
+        active = sum(1 for r in p["rows"] if field_text(r.get("Status")).casefold() not in done_status)
+        risk = sum(1 for r in p["rows"] if field_text(r.get("Risk / Blocker")))
+        elements.append({"tag": "markdown", "content": f"**{name}**  ·  **{avg}%** tiến độ\nMilestone: {milestones} · Đang làm: {active} · Hoàn tất: {p['done']} · Risk: {risk}"})
+    def section(title, values): return {"tag": "markdown", "content": f"**{title}**\n" + ("\n".join(f"• {v}" for v in values[:10]) if values else "Không có")}
+    elements += [{"tag": "hr"}, section("🔴 Việc quá hạn", overdue), section("🟡 Hạn trong 2 ngày", due_soon), section("⚠️ Risk / Blocker", blockers), section("➡️ Next action & PIC", next_actions), {"tag": "note", "elements": [{"tag": "plain_text", "content": "Nguồn: Delivery Plan · Tự động lúc 09:00 ICT mỗi ngày"}]}]
+    card = {"config": {"wide_screen_mode": True}, "header": {"template": "blue", "title": {"tag": "plain_text", "content": "☀️ Daily Project Report"}}, "elements": elements}
+    url = f"{DOMAIN}/open-apis/im/v1/messages?receive_id_type=chat_id"
+    payload = {"receive_id": DAILY_PROGRESS_CHAT_ID, "msg_type": "interactive", "content": json.dumps(card, ensure_ascii=False)}
+    r = requests.post(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json=payload, timeout=20)
+    if r.status_code >= 300:
+        log.warning("Daily progress card send failed %s: %s", r.status_code, r.text[:300]); return False
+    log.info("Daily progress card sent to chat %s", DAILY_PROGRESS_CHAT_ID)
+    return True
+
+def daily_progress_loop():
+    sent_date = None
+    tz = datetime.timezone(datetime.timedelta(hours=7))
+    while True:
+        now = datetime.datetime.now(tz)
+        if DAILY_PROGRESS_ENABLED and DAILY_PROGRESS_CHAT_ID and now.hour == DAILY_PROGRESS_HOUR and sent_date != now.date():
+            try: send_daily_progress_card()
+            except Exception: log.exception("Daily progress notification failed")
+            sent_date = now.date()
+        threading.Event().wait(45)
 
 def normalize_name(value):
     return re.sub(r"\s+", " ", field_text(value).casefold()).strip()
@@ -366,6 +692,7 @@ def update_delivery_progress(plan, meeting_title=""):
                 "Source Meeting": meeting_title,
                 "AI Confidence": "High" if milestone_name else "Low",
                 "Needs Review": "No",
+                "Stage": stage_for_milestone(milestone_name),
             }
             if milestone.get("progress_percent") is not None:
                 fields["Progress %"] = milestone.get("progress_percent")
@@ -387,12 +714,13 @@ def update_delivery_progress(plan, meeting_title=""):
                 task_row = index.get(tkey)
                 fields = {
                     "Status": task.get("status") or "Open",
-                    "PIC": task.get("owner") or "",
+                    "PIC": pic_field(resolve_pic(title, milestone_name, task.get("owner") or "", fallback_owner="")),
                     "Priority": task.get("priority") or "Medium",
                     "Next Action": task.get("next_step") or "",
                     "Source Meeting": meeting_title,
                     "AI Confidence": "High",
                     "Needs Review": "No",
+                    "Stage": stage_for_milestone(milestone_name),
                 }
                 if task.get("progress_percent") is not None:
                     fields["Progress %"] = task.get("progress_percent")
@@ -447,11 +775,43 @@ def participant_ids(event):
     walk(event)
     return found
 
-def extraction_prompt(transcript):
+def available_project_context():
+    """Return the live Project → Milestone → Stage map for AI classification."""
+    try:
+        projects = bitable_list(PROJECTS_TABLE_ID)
+        delivery = bitable_list(DELIVERY_TABLE_ID) if DELIVERY_TABLE_ID else []
+        by_project = {}
+        for row in delivery:
+            f = row.get("fields") or {}
+            project = field_text(f.get("Project"))
+            milestone = field_text(f.get("Milestone Group")) or field_text(f.get("Parent Item"))
+            stage = field_text(f.get("Stage"))
+            if project and milestone:
+                by_project.setdefault(normalize_name(project), {}).setdefault(milestone, stage)
+        lines = []
+        for row in projects:
+            f = row.get("fields") or {}
+            name = field_text(f.get("Project Name"))
+            if not name:
+                continue
+            milestones = by_project.get(normalize_name(name), {})
+            items = "; ".join(f"{m} [Stage: {s or 'chưa xác định'}]" for m, s in milestones.items())
+            lines.append(f"- Project: {name} | Milestones: {items or 'chưa có milestone'}")
+        return "\n".join(lines)
+    except Exception as exc:
+        log.warning("Unable to load project context for AI classification: %s", exc)
+        return ""
+
+def extraction_prompt(transcript, project_context=""):
     """Prompt shared by the hosted API and the optional local Codex fallback."""
     return f'''Đọc transcript cuộc họp dưới đây. Trả về DUY NHẤT JSON hợp lệ, không markdown:
 {{"meeting_summary_vi":"Tóm tắt toàn bộ cuộc họp bằng tiếng Việt chuẩn","decisions":["quyết định quan trọng"],"projects":[{{"project":"Tên project đúng như transcript","status":"Current status","health":"On track|At risk|Blocked|Unknown","progress_percent":0,"summary_vi":"Tình hình project","next_step":"Bước tiếp theo của project","milestones":[{{"milestone":"Tên milestone","status":"Current milestone status","progress_percent":0,"risk":"Rủi ro hoặc blocker, nếu có","next_step":"Bước tiếp theo của milestone","tasks":[{{"title":"việc cần làm","description":"mô tả rõ","owner":"tên người nếu nói rõ, nếu không để rỗng","deadline":"YYYY-MM-DD nếu có, nếu không để rỗng","status":"Open|In Progress|Done|Blocked","progress_percent":0,"next_step":"Bước tiếp theo","risk":"Rủi ro nếu có","priority":"High|Medium|Low"}}]}}]}}]}}
-Không bịa tên người hoặc deadline. Sửa lỗi chính tả và dịch sang tiếng Việt tự nhiên.
+QUAN TRỌNG: Tiêu đề meeting không phải tên project. Hãy phân loại nội dung vào đúng Project và Milestone trong danh sách Base bên dưới. Chỉ dùng đúng tên Project/Milestone có trong danh sách; không tạo project mới và không dùng tên meeting như "meeting daily" làm project. Nếu transcript không nói rõ project nhưng danh sách chỉ có một project, chọn project duy nhất đó. Mỗi task phải nằm trong milestone phù hợp; nếu chưa khớp chắc chắn, chọn milestone gần nhất và đánh dấu risk/Needs Review trong nội dung task.
+XỬ LÝ TIẾNG VIỆT: Transcript có thể là ASR nên thiếu dấu câu, lặp từ hoặc nghe nhầm. Hãy ghép lại câu hoàn chỉnh, sửa lỗi chính tả/dấu tiếng Việt và diễn đạt tự nhiên theo ngữ cảnh công việc. Giữ nguyên tên người, tên dự án, mã sản phẩm và thuật ngữ kỹ thuật (ví dụ CIM, SDK, Firebase, ASO), không tự dịch tên riêng. Không suy diễn phần âm thanh không rõ; nếu không chắc hãy ghi rõ "Chưa xác định" trong risk/summary.
+Trong nghiệp vụ CRM này, nếu ASR/AI ghi "CIM" nhưng ngữ cảnh nói về hệ thống quản lý khách hàng/UpLark thì phải chuẩn hóa thành "CRM".
+PROJECT CONTEXT TỪ LARK BASE:
+{project_context or '(không đọc được context — không được tự bịa project)'}
+Không bịa tên người hoặc deadline. Tất cả summary, decision, milestone, task, next_step và risk phải viết bằng tiếng Việt chuẩn, ngắn gọn nhưng đủ ý.
 TRANSCRIPT:
 {transcript[:50000]}'''
 
@@ -470,7 +830,17 @@ def parse_plan_output(output):
             candidates.append(value)
     return candidates[-1] if candidates else None
 
-def openai_plan(transcript):
+def normalize_business_terms(value):
+    """Correct recurring Vietnamese ASR confusions for this CRM workflow."""
+    if isinstance(value, str):
+        return re.sub(r"\bCIM\b", "CRM", value, flags=re.IGNORECASE)
+    if isinstance(value, list):
+        return [normalize_business_terms(item) for item in value]
+    if isinstance(value, dict):
+        return {key: normalize_business_terms(item) for key, item in value.items()}
+    return value
+
+def openai_plan(transcript, project_context=""):
     """Use OpenAI Responses API for production transcript extraction."""
     if not OPENAI_API_KEY or not transcript:
         return None
@@ -479,7 +849,7 @@ def openai_plan(transcript):
         client = OpenAI(api_key=OPENAI_API_KEY)
         response = client.responses.create(
             model=OPENAI_MODEL,
-            input=extraction_prompt(transcript),
+            input=extraction_prompt(transcript, project_context),
             store=False,
         )
         output = (response.output_text or "").strip()
@@ -491,13 +861,13 @@ def openai_plan(transcript):
         log.warning("OpenAI extraction unavailable; trying Codex fallback: %s", exc)
     return None
 
-def gemini_plan(transcript):
+def gemini_plan(transcript, project_context=""):
     """Use Gemini generateContent when a Gemini key is configured."""
     if not GEMINI_API_KEY or not transcript:
         return None
     try:
         body = {
-            "contents": [{"parts": [{"text": extraction_prompt(transcript)}]}],
+            "contents": [{"parts": [{"text": extraction_prompt(transcript, project_context)}]}],
             "generationConfig": {"responseMimeType": "application/json"},
         }
         model_path = urllib.parse.quote(GEMINI_MODEL, safe='')
@@ -522,11 +892,11 @@ def gemini_plan(transcript):
         log.warning("Gemini extraction unavailable; trying OpenAI/Codex fallback: %s", exc)
     return None
 
-def codex_plan(transcript):
+def codex_plan(transcript, project_context=""):
     """Normalize Vietnamese transcript and extract a strict project/task plan."""
     if not transcript:
         return {"project": "Lark meeting project", "tasks": []}
-    prompt = extraction_prompt(transcript)
+    prompt = extraction_prompt(transcript, project_context)
     try:
         result = subprocess.run(
             [CODEX_BIN, "exec", "--ephemeral", "--skip-git-repo-check", "-"],
@@ -541,7 +911,31 @@ def codex_plan(transcript):
         log.warning("Codex extraction unavailable; using fallback: %s", exc)
     return {"project": "Lark meeting project", "summary_vi": transcript[:5000], "tasks": []}
 
-def create_project_and_tasks(event, title, transcript):
+def _match_existing_project(project_name, title, transcript):
+    """Map AI output to an existing Project; never invent a project name."""
+    rows = bitable_list(PROJECTS_TABLE_ID)
+    candidates = [(r.get("record_id", ""), field_text((r.get("fields") or {}).get("Project Name"))) for r in rows]
+    candidates = [(rid, name) for rid, name in candidates if rid and name]
+    if not candidates:
+        return "", ""
+    target = re.sub(r"[^\w\s]+", " ", (project_name or "").casefold())
+    target_tokens = set(target.split())
+    # Start below zero so a valid single-project candidate with zero token
+    # overlap is still retained for the unambiguous fallback below.
+    best = (-1.0, "", "")
+    context = f"{title or ''} {transcript[:1200] or ''}".casefold()
+    for rid, name in candidates:
+        norm = re.sub(r"[^\w\s]+", " ", name.casefold())
+        tokens = set(norm.split())
+        score = 1.0 if norm == target.strip() else (len(target_tokens & tokens) / max(1, len(target_tokens | tokens)))
+        if name.casefold() in context: score += 0.35
+        if score > best[0]: best = (score, rid, name)
+    # If there is only one live project, it is the safe meeting context.
+    if best[0] >= 0.20 or len(candidates) == 1:
+        return best[1], best[2]
+    return "", ""
+
+def create_project_and_tasks(event, title, transcript, allow_project_create=False):
     """Create a project and one Base task per extracted action item.
 
     The webhook is the single owner of task creation.  AI-provided owners are
@@ -551,14 +945,23 @@ def create_project_and_tasks(event, title, transcript):
     if not PROJECTS_TABLE_ID or (not TASKS_TABLE_ID and not DELIVERY_TABLE_ID):
         log.warning("Project/task table IDs are not configured; skipping task creation")
         return {"project": title, "tasks": []}
+    project_context = available_project_context()
     providers = {
         "codex": [codex_plan],
         "gemini": [gemini_plan],
         "openai": [openai_plan],
         "auto": [gemini_plan, openai_plan, codex_plan],
     }.get(AI_PROVIDER, [codex_plan])
-    plan = next((candidate for provider in providers if (candidate := provider(transcript))), None)
-    plan = plan or {"project": title, "tasks": []}
+    plan = next((candidate for provider in providers if (candidate := provider(transcript, project_context))), None)
+    plan = normalize_business_terms(plan or {"project": title, "tasks": []})
+    # A meeting transcript may contain only a meeting title and a milestone,
+    # with no explicit project name. Resolve that missing project from Base
+    # before flattening tasks; the title must never become a project record.
+    if not plan.get("projects") and not plan.get("project"):
+        only_project = latest_project_record()
+        only_name = field_text((only_project.get("fields") or {}).get("Project Name"))
+        if only_project.get("record_id") and only_name:
+            plan["project"] = only_name
     owners = participant_ids(event)
     meeting_owner = ((event.get("meeting") or {}).get("owner") or {}).get("id", {})
     fallback_owner = meeting_owner.get("open_id") if isinstance(meeting_owner, dict) else ""
@@ -568,11 +971,27 @@ def create_project_and_tasks(event, title, transcript):
     for project in projects:
         project_name = project.get("project") or project.get("name") or title or "Lark meeting project"
         project_id = find_project_id(project_name)
-        if not project_id:
+        if project_id:
+            canonical_name = project_name
+        elif allow_project_create:
             project_id = bitable_create(PROJECTS_TABLE_ID, {"Project Name": project_name})
+            canonical_name = project_name
             clone_workflow_template(project_id, project_name, fallback_owner)
         else:
-            log.info("Matched existing project %s (%s); skipping template clone", project_name, project_id)
+            project_id, canonical_name = _match_existing_project(project_name, title, transcript)
+            # Meeting titles are often not project names (for example
+            # "meeting daily"). When this Base has a single active project,
+            # use it as the unambiguous meeting context.
+            if not project_id:
+                only_project = latest_project_record()
+                only_name = field_text((only_project.get("fields") or {}).get("Project Name"))
+                if only_project.get("record_id") and only_name:
+                    project_id, canonical_name = only_project["record_id"], only_name
+            if not project_id:
+                log.warning("Meeting project '%s' did not match an existing Project; no project/task created", project_name)
+                continue
+            project_name = canonical_name
+        log.info("Matched existing project %s (%s); meeting tasks will stay in its Delivery Plan", project_name, project_id)
         project_tasks = []
         if project.get("milestone"):
             project_tasks = project.get("tasks") or []
@@ -588,12 +1007,13 @@ def create_project_and_tasks(event, title, transcript):
             if not task_title:
                 continue
             ai_owner = str(task.get("owner") or "").strip()
-            owner = ai_owner if ai_owner.startswith("ou_") else fallback_owner
+            owner = resolve_pic(task_title, str(task.get("milestone") or project.get("milestone") or ""), ai_owner, fallback_owner)
             if DELIVERY_TABLE_ID:
                 milestone_name = str(task.get("milestone") or project.get("milestone") or "").strip()
                 parent_id = ""
+                delivery_rows = bitable_list(DELIVERY_TABLE_ID)
                 if milestone_name:
-                    for r in bitable_list(DELIVERY_TABLE_ID):
+                    for r in delivery_rows:
                         rf = r.get("fields") or {}
                         if field_text(rf.get("Item Name")).casefold() == milestone_name.casefold() and field_text(rf.get("Project")).casefold() == project_name.casefold():
                             parent_id = r.get("record_id", ""); break
@@ -601,14 +1021,17 @@ def create_project_and_tasks(event, title, transcript):
                     "Item Name": task_title,
                     "Item Type": "Task",
                     "Status": task.get("status") or "Open",
-                    "PIC": owner,
+                    "PIC": pic_field(owner),
                     "Project": project_name,
                     "Milestone Group": milestone_name or task_title,
                     "Priority": task.get("priority") or "Medium",
                     "Source Meeting": title,
                     "AI Confidence": "High" if ai_owner.startswith("ou_") else "Medium",
                     "Needs Review": "No" if task_title else "Yes",
+                    "Stage": stage_for_milestone(milestone_name),
                 }
+                if project_id:
+                    task_fields["Project Link"] = [project_id]
                 if milestone_name: task_fields["Parent Item"] = milestone_name
                 target_table = DELIVERY_TABLE_ID
             else:
@@ -620,12 +1043,37 @@ def create_project_and_tasks(event, title, transcript):
                 task_fields["Due Date" if DELIVERY_TABLE_ID else "Deadline"] = due_ms
             if project_id:
                 task_fields.setdefault("Project", project_name)
-            try:
-                bitable_create(target_table, task_fields)
-            except Exception as exc:
-                log.warning("Task link failed, retrying without Project: %s", exc)
-                task_fields.pop("Project", None)
-                bitable_create(target_table, task_fields)
+            # Prefer updating the matching template task.  AI often rewrites
+            # the action item in Vietnamese, while the 21-day template uses a
+            # canonical title; creating a new row here would break the
+            # template hierarchy and produce apparent duplicates.
+            existing_task = None
+            if DELIVERY_TABLE_ID:
+                title_key = normalize_name(task_title)
+                for candidate in delivery_rows:
+                    cf = candidate.get("fields") or {}
+                    if field_text(cf.get("Project")).casefold() != project_name.casefold():
+                        continue
+                    if field_text(cf.get("Item Type")).casefold() != "task":
+                        continue
+                    if normalize_name(cf.get("Item Name")) == title_key:
+                        existing_task = candidate; break
+                if not existing_task and milestone_name:
+                    # Current 21-day template has one canonical task per
+                    # milestone. Reuse that row when the AI wording differs.
+                    candidates = [c for c in delivery_rows if field_text((c.get("fields") or {}).get("Project")).casefold() == project_name.casefold() and field_text((c.get("fields") or {}).get("Item Type")).casefold() == "task" and field_text((c.get("fields") or {}).get("Milestone Group")).casefold() == milestone_name.casefold()]
+                    if len(candidates) == 1:
+                        existing_task = candidates[0]
+                        log.info("Mapped AI action '%s' to template task '%s'", task_title, field_text((existing_task.get("fields") or {}).get("Item Name")))
+            if existing_task:
+                bitable_update(DELIVERY_TABLE_ID, existing_task.get("record_id", ""), task_fields)
+            else:
+                try:
+                    bitable_create(target_table, task_fields)
+                except Exception as exc:
+                    log.warning("Task link failed, retrying without Project: %s", exc)
+                    task_fields.pop("Project", None)
+                    bitable_create(target_table, task_fields)
             total_tasks += 1
     log.info("Created %d project(s) and %d extracted task(s)", len(projects), total_tasks)
     return plan
@@ -664,13 +1112,16 @@ def create_record(event):
         "Ingestion Status": "Imported — awaiting transcript",
         "AI Processing Status": "Pending",
     }
-    if owner.get("open_id"):
-        fields["Participants"] = [{"id": owner["open_id"], "type": "text"}]
+    # Participants is a GroupChat field in this Base; an event owner open_id
+    # is not a valid GroupChat value, so leave it for Lark's native sync.
     fields = {k: v for k, v in fields.items() if v not in ("", None)}
     url = f"{DOMAIN}/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records"
     r = requests.post(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json={"fields": fields}, timeout=30)
     if r.status_code >= 300:
         raise RuntimeError(f"Base create failed {r.status_code}: {r.text[:500]}")
+    body = r.json()
+    if body.get("code", 0) not in (0, None):
+        raise RuntimeError(f"Base create failed {body.get('code')}: {body.get('msg', '')}")
     log.info("Base record created for event %s", event_id)
 
 def extract_minutes_url(value):
@@ -703,6 +1154,15 @@ def create_forwarded_minutes_record(event, minute_url):
     # actual opaque token, which is the leading URL-safe segment.
     token_match = re.match(r"([A-Za-z0-9_-]+)", raw_token)
     minute_token = token_match.group(1) if token_match else ""
+    # One user action can produce both a message event and a forwarded-card
+    # event.  Treat the opaque Minutes token as the idempotency key so only
+    # one Base row/project is created.
+    if minute_token:
+        with PROCESSED_EVENTS_LOCK:
+            if minute_token in PROCESSED_MINUTES or minute_token in PROCESSING_MINUTES:
+                log.info("Skipping duplicate forwarded Minutes %s", minute_token)
+                return
+            PROCESSING_MINUTES.add(minute_token)
     transcript = ""
     if minute_token and minute_token.lower() not in {"minutes", "minute", "min"}:
         try:
@@ -710,24 +1170,50 @@ def create_forwarded_minutes_record(event, minute_url):
             log.info("Transcript fetched for forwarded Minutes %s", minute_token)
         except Exception as exc:
             log.warning("Transcript fetch failed for forwarded Minutes %s: %s", minute_token, exc)
+            # Do not mark a link as processed and do not create an empty AI
+            # project/card. The user can resend the link after OAuth refresh.
+            with PROCESSED_EVENTS_LOCK:
+                PROCESSING_MINUTES.discard(minute_token)
+            return
+    meeting_title, metadata_participants = minutes_title_and_participants(minute_token)
+    # Forwarded rich cards often carry the original title in the message
+    # payload; use it when the Minutes metadata endpoint is unavailable.
+    meeting_title = meeting_title or find_value(event, {"meeting_title", "topic", "title", "name"}) or "Forwarded Lark meeting minutes"
     fields = {
-        "Meeting Title": "Forwarded Lark meeting minutes",
+        "Meeting Title": meeting_title,
         "Minutes URL": minute_url,
         "Source Event ID": event_id,
         "Ingestion Status": "Imported — awaiting AI" if transcript else "Minutes link received — transcript fetch pending",
         "AI Processing Status": "Pending",
     }
+    # Do not write user open_ids into the GroupChat field. That field only
+    # accepts chat identifiers and would make the entire record create fail
+    # with WrongRequestBody.
     if transcript:
         fields["Transcript / Raw Recap"] = transcript
     url = f"{DOMAIN}/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records"
-    r = requests.post(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json={"fields": fields}, timeout=30)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Base create failed {r.status_code}: {r.text[:500]}")
-    record_id = (r.json().get("data") or {}).get("record", {}).get("record_id", "")
-    log.info("Base record created from forwarded Minutes link for event %s", event_id)
-    plan = create_project_and_tasks(event, fields["Meeting Title"], transcript)
-    if record_id and plan:
-        bitable_update(TABLE_ID, record_id, plan_to_meeting_fields(plan))
+    try:
+        r = requests.post(url, headers={"Authorization": f"Bearer {tenant_token()}", "Content-Type": "application/json"}, json={"fields": fields}, timeout=30)
+        if r.status_code >= 300:
+            raise RuntimeError(f"Base create failed {r.status_code}: {r.text[:500]}")
+        body = r.json()
+        if body.get("code", 0) not in (0, None):
+            raise RuntimeError(f"Base create failed {body.get('code')}: {body.get('msg', '')}")
+        record_id = (body.get("data") or {}).get("record", {}).get("record_id", "")
+        log.info("Base record created from forwarded Minutes link for event %s", event_id)
+        plan = create_project_and_tasks(event, fields["Meeting Title"], transcript)
+        if record_id and plan:
+            bitable_update(TABLE_ID, record_id, plan_to_meeting_fields(plan))
+        send_progress_card(event, plan, fields["Meeting Title"], transcript)
+        if minute_token:
+            with PROCESSED_EVENTS_LOCK:
+                PROCESSING_MINUTES.discard(minute_token)
+                PROCESSED_MINUTES.add(minute_token)
+    except Exception:
+        if minute_token:
+            with PROCESSED_EVENTS_LOCK:
+                PROCESSING_MINUTES.discard(minute_token)
+        raise
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -771,10 +1257,19 @@ class Handler(BaseHTTPRequestHandler):
             event["_event_id"] = header.get("event_id", "unknown")
             event_type = header.get("event_type") or header.get("event")
             event["_event_type"] = event_type
-            if parsed_path == "/lark/project-created" or event_type in {"bitable.record.created_v1", "project.created_v1"}:
+            created_table_id = find_value(event, {"table_id", "tableId"})
+            is_project_create = parsed_path == "/lark/project-created" or event_type == "project.created_v1" or (event_type == "bitable.record.created_v1" and created_table_id == PROJECTS_TABLE_ID)
+            if is_project_create:
                 handle_project_created(event)
                 body = json.dumps({"ok": True, "status": "template_cloned"}).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+            if event_type in {"bitable.record.updated_v1", "bitable.record.changed_v1"}:
+                fields = event.get("fields") or (event.get("record") or {}).get("fields") or (event.get("data") or {}).get("fields") or {}
+                table_id = find_value(event, {"table_id", "tableId"})
+                project_name = field_text(fields.get("Project")) if isinstance(fields, dict) else ""
+                if DELIVERY_TABLE_ID and (not table_id or table_id == DELIVERY_TABLE_ID) and project_name:
+                    sync_project_from_delivery(project_name)
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
             meeting_id = (event.get("meeting") or {}).get("id")
             log.info("Webhook received: event=%s meeting=%s", event_type, meeting_id)
 
@@ -798,7 +1293,14 @@ class Handler(BaseHTTPRequestHandler):
                             log.info("Found Minutes link in parent message %s", parent_id)
                             break
                 if minute_url:
-                    create_forwarded_minutes_record(event, minute_url)
+                    try:
+                        create_forwarded_minutes_record(event, minute_url)
+                    except Exception:
+                        # Allow Lark to retry a failed delivery instead of
+                        # treating the event as successfully processed.
+                        with PROCESSED_EVENTS_LOCK:
+                            PROCESSED_EVENTS.discard(event_id)
+                        raise
                 else:
                     # Keep a bounded sample so rich-card/forwarded-message
                     # payloads can be mapped without logging credentials.
@@ -834,5 +1336,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", os.getenv("WEBHOOK_PORT", "8080")))
+    if DAILY_PROGRESS_ENABLED:
+        threading.Thread(target=daily_progress_loop, daemon=True, name="daily-progress").start()
+        log.info("Daily progress automation enabled for %02d:00 ICT", DAILY_PROGRESS_HOUR)
     log.info("Listening on http://127.0.0.1:%s/lark/events", port)
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
