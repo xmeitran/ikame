@@ -1031,6 +1031,7 @@ def create_project_and_tasks(event, title, transcript, allow_project_create=Fals
                     "AI Confidence": "High" if ai_owner.startswith("ou_") else "Medium",
                     "Needs Review": "No" if task_title else "Yes",
                     "Stage": stage_for_milestone(milestone_name),
+                    "Next Action": (task.get("next_action") or task.get("description") or f"Thực hiện: {task_title}").strip(),
                 }
                 if project_id:
                     task_fields["Project Link"] = [project_id]
