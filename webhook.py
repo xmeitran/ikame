@@ -1258,12 +1258,14 @@ class Handler(BaseHTTPRequestHandler):
             event_type = header.get("event_type") or header.get("event")
             event["_event_type"] = event_type
             created_table_id = find_value(event, {"table_id", "tableId"})
-            is_project_create = parsed_path == "/lark/project-created" or event_type == "project.created_v1" or (event_type == "bitable.record.created_v1" and created_table_id == PROJECTS_TABLE_ID)
+            change_action = str(find_value(event, {"action", "change_type", "changeType", "operation"}) or "").casefold()
+            bitable_change_event = event_type == "drive.file.bitable_record_changed_v1"
+            is_project_create = parsed_path == "/lark/project-created" or event_type == "project.created_v1" or (event_type == "bitable.record.created_v1" and created_table_id == PROJECTS_TABLE_ID) or (bitable_change_event and created_table_id == PROJECTS_TABLE_ID and change_action not in {"record_deleted", "deleted", "delete"})
             if is_project_create:
                 handle_project_created(event)
                 body = json.dumps({"ok": True, "status": "template_cloned"}).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
-            if event_type in {"bitable.record.updated_v1", "bitable.record.changed_v1"}:
+            if event_type in {"bitable.record.updated_v1", "bitable.record.changed_v1", "drive.file.bitable_record_changed_v1"}:
                 fields = event.get("fields") or (event.get("record") or {}).get("fields") or (event.get("data") or {}).get("fields") or {}
                 table_id = find_value(event, {"table_id", "tableId"})
                 project_name = field_text(fields.get("Project")) if isinstance(fields, dict) else ""
